@@ -10,6 +10,9 @@ Network: true
 // Evita el acceso directo
 defined( 'ABSPATH' ) || exit;
 
+// Matriz de red: qué tipos de contenido se sincronizan con qué subsitios (solo superadmins)
+require_once plugin_dir_path(__FILE__) . 'includes/network-settings.php';
+
 // Hook para crear el post type personalizado
 add_action('init', 'mms_register_synced_post_type');
 
@@ -33,27 +36,29 @@ function mms_register_synced_post_type() {
 add_action('save_post', 'mms_sync_post_to_sites', 10, 2);
 
 function mms_sync_post_to_sites($post_id, $post) {
-    // Si no es el sitio principal o el tipo de post no es 'post', o es una revisión, salir.
-    $post_types_availible = array(
-        'post', 
-        'caso-de-exito',
-        'evento',
-        'caso-de-exito',
-        'guia-o-manual-practi',
-        'infografia',
-        'informe-o-estudio',
-        'partner',
-        'plantilla-descargabl',
-        'podcast',
-        'recurso',
-        'servicio',
-        'solucion',
-        'tendencia',
-        'video',
-        'webinar'
-    );
-    
-    if (!in_array($post->post_type, $post_types_availible)) {
+    // Interruptor de emergencia: define( 'MMS_DISABLE_SYNC', true ); en wp-config.php
+    // para la sincronización automática sin desactivar el plugin (los synced_post
+    // existentes siguen registrados y visibles en los subsitios).
+    if (defined('MMS_DISABLE_SYNC') && MMS_DISABLE_SYNC) {
+        return;
+    }
+
+    // Solo desde el sitio principal; evitar revisiones, autosaves y auto-drafts
+    if (!is_main_site() || wp_is_post_revision($post_id) || $post->post_status === 'auto-draft' || (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE)) {
+        return;
+    }
+
+    // Solo contenidos publicados: el synced_post se crea siempre como 'publish', así que
+    // sincronizar borradores/pendientes/privados (p. ej. los que genera la IA) los hacía
+    // públicos en los subsitios y disparaba en cada subsitio el vaciado de cachés.
+    if ($post->post_status !== 'publish') {
+        return;
+    }
+
+    // Subsitios configurados para este tipo de contenido en
+    // Administración de la red → Ajustes → Sincronización. Por defecto, ninguno.
+    $target_sites = mms_get_sync_target_sites($post->post_type);
+    if (empty($target_sites)) {
         return;
     }
 
@@ -61,47 +66,43 @@ function mms_sync_post_to_sites($post_id, $post) {
     $original_post_type_slug = $title_object_post_type->slug;
     $original_post_type_title = $title_object_post_type->title;
 
-    // Evitar bucles infinitos y auto-drafts
-
-    if (!is_main_site() || $post->post_status === 'auto-draft' || (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE)) {
-        return;
-    }
-
-    $sites = get_sites();
-    foreach ($sites as $site) {
-        if ($site->id !== get_current_blog_id()) { // No sincronizar en el mismo sitio
-            switch_to_blog($site->id);
-            
-            
-            $post_types_no_duplicate = get_field('post_types_no_duplicate', 'options');
-            if(!in_array($original_post_type_slug, $post_types_no_duplicate)) {
-                // Comprobar si ya existe un post sincronizado para el post original
-                $existing_posts = get_posts(array(
-                    'post_type'  => 'synced_post',
-                    'meta_query' => array(
-                        array(
-                            'key'   => 'original_post_id',
-                            'value' => $post_id,
-                        ),
-                    ),
-                ));
-                if (empty($existing_posts)) {
-                    // Crear el post sincronizado con el ID original
-                    $new_post_args = array(
-                        'post_title'  => $post->post_title,
-                        'post_type'   => 'synced_post',
-                        'post_status' => 'publish',
-                    );
-                    $new_post_id = wp_insert_post($new_post_args);
-                    update_field('original_post_id', $post_id, $new_post_id);
-                    update_field('original_post_type_slug', $original_post_type_slug, $new_post_id);
-                    update_field('original_post_type_title', $original_post_type_title, $new_post_id);
-                }
-            }
-
-
-            restore_current_blog();
+    foreach ($target_sites as $site_id) {
+        if ($site_id === get_current_blog_id() || !get_site($site_id)) {
+            continue;
         }
+
+        switch_to_blog($site_id);
+
+        // Comprobar si ya existe un post sincronizado para el post original
+        $existing_posts = get_posts(array(
+            'post_type'   => 'synced_post',
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => 1,
+            'meta_query'  => array(
+                array(
+                    'key'   => 'original_post_id',
+                    'value' => $post_id,
+                ),
+            ),
+        ));
+
+        if (empty($existing_posts)) {
+            // Crear el post sincronizado con el ID original
+            $new_post_id = wp_insert_post(array(
+                'post_title'  => $post->post_title,
+                'post_type'   => 'synced_post',
+                'post_status' => 'publish',
+            ));
+
+            if ($new_post_id && !is_wp_error($new_post_id)) {
+                update_field('original_post_id', $post_id, $new_post_id);
+                update_field('original_post_type_slug', $original_post_type_slug, $new_post_id);
+                update_field('original_post_type_title', $original_post_type_title, $new_post_id);
+            }
+        }
+
+        restore_current_blog();
     }
 }
 
@@ -166,16 +167,34 @@ function mms_show_original_post_type_info($post) {
 
 function duplicate_attachment($attachment_id, $target_site_id = null) {
     switch_to_blog(get_main_site_id());
-        $attachment = get_post($attachment_id);
-        if (!$attachment) {
-            return false;
-        }
-        $file_path = get_attached_file($attachment_id);
-    if($target_site_id) {
+    $attachment = get_post($attachment_id);
+    $file_path  = $attachment ? get_attached_file($attachment_id) : '';
+    // Volver siempre al blog de partida: antes el return sin restore y el
+    // switch_to_blog() anidado dejaban la pila de blogs desequilibrada y el resto
+    // de la petición seguía ejecutándose en el sitio equivocado.
+    restore_current_blog();
+
+    if (!$attachment) {
+        return false;
+    }
+
+    // Quien llama ya está en el sitio destino; si no coincide, cambiar y volver al final.
+    $switched = $target_site_id && (int) $target_site_id !== get_current_blog_id();
+    if ($switched) {
         switch_to_blog($target_site_id);
-    }else{
+    }
+    $new_attachment_id = mms_copy_attachment_file($file_path);
+    if ($switched) {
         restore_current_blog();
     }
+
+    return $new_attachment_id;
+}
+
+/**
+ * Copia el archivo al uploads del sitio actual y crea su attachment.
+ */
+function mms_copy_attachment_file($file_path) {
 
     if (!file_exists($file_path)) {
         return false;
@@ -444,9 +463,14 @@ function mms_enqueue_duplicate_scripts($hook) {
     if (!in_array($hook, array('edit.php', 'post.php', 'post-new.php'))) {
         return;
     }
+
+    // "Duplicar en" solo existe en el sitio principal
+    if (!mms_can_duplicate_to_sites()) {
+        return;
+    }
     
-    wp_enqueue_script('mms-duplicate-script', plugin_dir_url(__FILE__) . 'js/duplicate-admin.js', array('jquery'), '1.0.0', true);
-    wp_enqueue_style('mms-duplicate-style', plugin_dir_url(__FILE__) . 'css/duplicate-admin.css', array(), '1.0.0');
+    wp_enqueue_script('mms-duplicate-script', plugin_dir_url(__FILE__) . 'js/duplicate-admin.js', array('jquery'), '1.1.0', true);
+    wp_enqueue_style('mms-duplicate-style', plugin_dir_url(__FILE__) . 'css/duplicate-admin.css', array(), '1.1.0');
     
     // Localize script with AJAX data
     wp_localize_script('mms-duplicate-script', 'mms_ajax', array(
@@ -466,33 +490,48 @@ function mms_enqueue_duplicate_scripts($hook) {
 /**
  * Add duplicate content action to post/page row actions
  */
+/**
+ * Duplicar contenido a otro sitio solo se puede hacer desde el sitio principal
+ * y con permisos de superadministrador.
+ */
+function mms_can_duplicate_to_sites() {
+    return is_multisite() && is_main_site() && current_user_can('manage_sites');
+}
+
+/**
+ * Sitios de destino para "Duplicar en": todos los de la red menos el actual,
+ * sin los borrados ni los marcados como spam, ordenados por nombre.
+ *
+ * @return WP_Site[]
+ */
+function mms_get_duplicate_target_sites() {
+    $current_site_id = get_current_blog_id();
+
+    $sites = array_filter(
+        get_sites(array('number' => 0, 'deleted' => 0, 'spam' => 0)),
+        function ($site) use ($current_site_id) {
+            return (int) $site->blog_id !== (int) $current_site_id;
+        }
+    );
+
+    usort($sites, function ($a, $b) {
+        return strcasecmp(get_blog_option($a->blog_id, 'blogname'), get_blog_option($b->blog_id, 'blogname'));
+    });
+
+    return $sites;
+}
+
 function mms_add_duplicate_content_action($actions, $post) {
     // Only show for published posts/pages
-    if ($post->post_status !== 'publish') {
+    if ($post->post_status !== 'publish' || $post->post_type === 'synced_post') {
         return $actions;
     }
-    
-    // Check user capabilities
-    if (!current_user_can('manage_sites')) {
+
+    // Solo desde el sitio principal y para superadministradores
+    if (!mms_can_duplicate_to_sites()) {
         return $actions;
     }
-    
-    // Get available sites
-    $sites = get_sites(array('number' => 0));
-    $current_site_id = get_current_blog_id();
-    
-    // Filter out current site
-    $available_sites = array();
-    foreach ($sites as $site) {
-        if ($site->blog_id != $current_site_id) {
-            $available_sites[] = $site;
-        }
-    }
-    
-    if (empty($available_sites)) {
-        return $actions;
-    }
-    
+
     // Add duplicate action
     $actions['duplicate_to'] = sprintf(
         '<a href="#" class="mms-duplicate-content" data-post-id="%d" data-post-type="%s">Duplicar en</a>',
@@ -513,29 +552,23 @@ function mms_add_duplicate_meta_box() {
         return;
     }
     
-    // Check user capabilities
-    if (!current_user_can('manage_sites')) {
+    // Solo desde el sitio principal y para superadministradores
+    if (!mms_can_duplicate_to_sites()) {
         return;
     }
-    
-    // Get available sites
-    $sites = get_sites(array('number' => 0));
-    $current_site_id = get_current_blog_id();
-    
-    // Filter out current site
-    $available_sites = array();
-    foreach ($sites as $site) {
-        if ($site->blog_id != $current_site_id) {
-            $available_sites[] = $site;
-        }
-    }
-    
-    if (empty($available_sites)) {
-        return;
-    }
-    
+
     // Get all public post types
     $post_types = get_post_types(array('public' => true), 'names');
+    
+    // Post types excluidos donde no se debe mostrar el meta box de duplicar
+    $excluded_post_types = array(
+        'auditoria-de-articul',
+        'synced_post',
+        // Agrega más post types aquí si es necesario
+    );
+    
+    // Filtrar los post types excluidos
+    $post_types = array_diff($post_types, $excluded_post_types);
     
     // Add meta box to all public post types
     foreach ($post_types as $post_type) {
@@ -575,23 +608,23 @@ function mms_handle_duplicate_content_ajax() {
         wp_die('Token de seguridad no válido.');
     }
     
-    // Check capabilities
-    if (!current_user_can('manage_sites')) {
-        wp_die('No tienes permisos para duplicar contenido.');
+    // Solo desde el sitio principal y para superadministradores
+    if (!mms_can_duplicate_to_sites()) {
+        wp_send_json_error('Solo se puede duplicar contenido desde el sitio principal.');
     }
-    
+
     $post_id = (int) $_POST['post_id'];
     $target_site_id = (int) $_POST['target_site_id'];
-    
+
     // Validate post exists
     $post = get_post($post_id);
     if (!$post) {
         wp_send_json_error('Post no encontrado.');
     }
-    
+
     // Validate target site exists
     $target_site = get_site($target_site_id);
-    if (!$target_site) {
+    if (!$target_site || $target_site->deleted || $target_site->spam) {
         wp_send_json_error('Sitio destino no encontrado.');
     }
     
@@ -623,52 +656,48 @@ function mms_get_available_sites_ajax() {
         wp_die('Token de seguridad no válido.');
     }
     
-    // Check capabilities
-    if (!current_user_can('manage_sites')) {
-        wp_die('No tienes permisos para ver sitios.');
+    // Solo desde el sitio principal y para superadministradores
+    if (!mms_can_duplicate_to_sites()) {
+        wp_send_json_error('Solo se puede duplicar contenido desde el sitio principal.');
     }
-    $post_slug = isset($_POST['post_slug']) ? sanitize_text_field($_POST['post_slug']) : '';
-    $post_type = isset($_POST['post_type']) ? sanitize_text_field($_POST['post_type']) : '';
-    
-    // Get available sites
-    $sites = get_sites(array('number' => 0));
-    $current_site_id = get_current_blog_id();
-    
-    // Filter out current site and format data
+
+    // El slug y el tipo se leen del propio post: antes llegaban de la página
+    // (vacíos en el listado), la comprobación encontraba cualquier entrada y se
+    // ocultaban casi todos los sitios.
+    $post = get_post(isset($_POST['post_id']) ? (int) $_POST['post_id'] : 0);
+    if (!$post) {
+        wp_send_json_error('Post no encontrado.');
+    }
+
+    // Se muestran todos los sitios; los que ya tienen un contenido del mismo tipo
+    // y con el mismo slug se marcan como "ya existe" y no se pueden elegir.
     $available_sites = array();
-    foreach ($sites as $site) {
-        if ($site->blog_id == $current_site_id) {
-            continue;
-        }
+    foreach (mms_get_duplicate_target_sites() as $site) {
+        $exists = false;
 
-        // Check if a post with the same slug and post type exists on this site
-        switch_to_blog($site->blog_id);
-
-        $args = array(
-            'name'           => $post_slug,
-            'post_type'      => $post_type,
-            'post_status'    => 'any',
-            'posts_per_page' => 1,
-            'fields'         => 'ids',
-        );
-        $query = new WP_Query($args);
-        $exists = !empty($query->posts);
-
-        restore_current_blog();
-
-        if ($exists) {
-            // If post exists, do not add this site to available_sites
-            continue;
+        if ($post->post_name !== '') {
+            switch_to_blog($site->blog_id);
+            $existing = get_posts(array(
+                'name'             => $post->post_name,
+                'post_type'        => $post->post_type,
+                'post_status'      => 'any',
+                'numberposts'      => 1,
+                'fields'           => 'ids',
+                'suppress_filters' => true,
+            ));
+            $exists = !empty($existing);
+            restore_current_blog();
         }
 
         $available_sites[] = array(
-            'blog_id' => $site->blog_id,
+            'blog_id'  => (int) $site->blog_id,
             'blogname' => get_blog_option($site->blog_id, 'blogname', $site->domain . $site->path),
-            'domain' => $site->domain,
-            'path' => $site->path
+            'domain'   => $site->domain,
+            'path'     => $site->path,
+            'exists'   => $exists,
         );
     }
-    
+
     wp_send_json_success(array('sites' => $available_sites));
 }
 

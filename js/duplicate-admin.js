@@ -16,6 +16,9 @@ jQuery(document).ready(function ($) {
 
     // Handle site selection
     $(document).on('click', '.mms-site-item', function () {
+        if ($(this).hasClass('is-disabled')) {
+            return;
+        }
         $('.mms-site-item').removeClass('selected');
         $(this).addClass('selected');
         $(this).find('input[type="radio"]').prop('checked', true);
@@ -73,21 +76,18 @@ jQuery(document).ready(function ($) {
         $('body').append(selectorHtml);
 
         // Load sites
-        loadAvailableSites();
+        loadAvailableSites(postId);
     }
 
-    function loadAvailableSites() {
-        var postSlug = mms_ajax.post_slug || '';
-        var postType = mms_ajax.post_type || '';
-
+    function loadAvailableSites(postId) {
+        // El servidor saca el slug y el tipo del propio post (el del enlace pulsado)
         $.ajax({
             url: mms_ajax.ajax_url,
             type: 'POST',
             data: {
                 action: 'get_available_sites',
                 nonce: mms_ajax.nonce,
-                post_slug: postSlug,
-                post_type: postType
+                post_id: postId
             },
             success: function (response) {
                 if (response.success) {
@@ -110,19 +110,24 @@ jQuery(document).ready(function ($) {
         if (sites.length === 0) {
             siteList.html('<p>No hay sitios disponibles para duplicar.</p>');
         } else {
-            var html = '';
+            siteList.empty();
             sites.forEach(function (site) {
-                html += `
-                    <div class="mms-site-item">
-                        <input type="radio" name="target_site" value="${site.blog_id}" id="site_${site.blog_id}">
-                        <label for="site_${site.blog_id}">
-                            <span class="mms-site-name">${site.blogname}</span>
-                            <span class="mms-site-url">${site.domain}${site.path}</span>
-                        </label>
-                    </div>
-                `;
+                var id = 'site_' + parseInt(site.blog_id, 10);
+                var item = $('<div class="mms-site-item"></div>');
+                var radio = $('<input type="radio" name="target_site">')
+                    .attr({ value: site.blog_id, id: id });
+                var label = $('<label></label>').attr('for', id)
+                    .append($('<span class="mms-site-name"></span>').text(site.blogname))
+                    .append($('<span class="mms-site-url"></span>').text(site.domain + site.path));
+
+                if (site.exists) {
+                    item.addClass('is-disabled');
+                    radio.prop('disabled', true);
+                    label.append($('<span class="mms-site-exists"></span>').text('Ya existe en este sitio'));
+                }
+
+                siteList.append(item.append(radio, label));
             });
-            siteList.html(html);
         }
 
         loading.hide();
