@@ -2,7 +2,7 @@
 /*
 Plugin Name: Sincronizador Multisite
 Description: Sincroniza entradas entre el sitio principal y los subsitios.
-Version: 1.0
+Version: 1.1.0
 Author: Tu Nombre
 Network: true
 */
@@ -10,8 +10,28 @@ Network: true
 // Evita el acceso directo
 defined( 'ABSPATH' ) || exit;
 
+define('MMS_VERSION', '1.1.0');
+
+/**
+ * Lee un campo ACF; si ACF no está cargado, lee la meta directamente
+ * (antes un ACF desactivado provocaba un error fatal al publicar).
+ */
+function mms_get_field($name, $post_id) {
+    return function_exists('get_field') ? get_field($name, $post_id) : get_post_meta($post_id, $name, true);
+}
+
+/**
+ * Guarda un campo ACF; si ACF no está cargado, guarda la meta directamente.
+ */
+function mms_update_field($name, $value, $post_id) {
+    return function_exists('update_field') ? update_field($name, $value, $post_id) : update_post_meta($post_id, $name, $value);
+}
+
 // Matriz de red: qué tipos de contenido se sincronizan con qué subsitios (solo superadmins)
 require_once plugin_dir_path(__FILE__) . 'includes/network-settings.php';
+
+// Media compartida en el bucket común (Offload Media) y correcciones de Offload en multisite
+require_once plugin_dir_path(__FILE__) . 'includes/offload-compat.php';
 
 // Hook para crear el post type personalizado
 add_action('init', 'mms_register_synced_post_type');
@@ -96,9 +116,9 @@ function mms_sync_post_to_sites($post_id, $post) {
             ));
 
             if ($new_post_id && !is_wp_error($new_post_id)) {
-                update_field('original_post_id', $post_id, $new_post_id);
-                update_field('original_post_type_slug', $original_post_type_slug, $new_post_id);
-                update_field('original_post_type_title', $original_post_type_title, $new_post_id);
+                mms_update_field('original_post_id', $post_id, $new_post_id);
+                mms_update_field('original_post_type_slug', $original_post_type_slug, $new_post_id);
+                mms_update_field('original_post_type_title', $original_post_type_title, $new_post_id);
             }
         }
 
@@ -117,12 +137,19 @@ add_action('add_meta_boxes', 'mms_add_duplicate_meta_box');
 add_action('wp_ajax_duplicate_content_to_site', 'mms_handle_duplicate_content_ajax');
 add_action('wp_ajax_get_available_sites', 'mms_get_available_sites_ajax');
 
+/**
+ * Enlace para convertir un synced_post en contenido local. El nonce va ligado al post.
+ */
+function mms_get_duplicate_link($post_id) {
+    return wp_nonce_url(
+        admin_url('admin-post.php?action=mms_duplicate_post&post_id=' . (int) $post_id),
+        'mms_duplicate_nonce_' . (int) $post_id
+    );
+}
+
 function mms_add_duplicate_button($actions, $post) {
-    if ($post->post_type === 'synced_post') {
-        $duplicate_link = wp_nonce_url(
-            admin_url('admin-post.php?action=mms_duplicate_post&post_id=' . $post->ID),
-            'mms_duplicate_nonce'
-        );
+    if ($post->post_type === 'synced_post' && current_user_can('publish_posts')) {
+        $duplicate_link = mms_get_duplicate_link($post->ID);
         $actions['duplicate'] = '<a href="' . esc_url($duplicate_link) . '" title="Duplicar esta entrada">Duplicar</a>';
     }
     return $actions;
@@ -133,18 +160,16 @@ add_action('post_submitbox_misc_actions', 'mms_add_duplicate_button_on_edit_scre
 
 function mms_add_duplicate_button_on_edit_screen($post) {
     // Asegúrate de que solo se muestre en el post type 'synced_post'
-    if ($post->post_type === 'synced_post') {
-        $duplicate_link = wp_nonce_url(
-            admin_url('admin-post.php?action=mms_duplicate_post&post_id=' . $post->ID),
-            'mms_duplicate_nonce'
-        );
+    if ($post->post_type === 'synced_post' && current_user_can('publish_posts')) {
+        $duplicate_link = mms_get_duplicate_link($post->ID);
+        $type_title = mms_get_field('original_post_type_title', $post->ID);
         ?>
         <div class="misc-pub-section misc-pub-duplicate">
             <a class="button button-primary button-large" href="<?php echo esc_url($duplicate_link); ?>" title="Duplicar en este sitio">
-                Duplicar <?= get_field('original_post_type_title', $post->ID) ?>
+                Duplicar <?php echo esc_html($type_title); ?>
             </a>
             <p class="description">
-                Esto creará una copia de <?= get_field('original_post_type_title', $post->ID) ?> en este sitio y eliminará esta entrada sincronizada.
+                Esto creará una copia de <?php echo esc_html($type_title); ?> en este sitio y eliminará esta entrada sincronizada.
             </p>
         </div>
         <?php
@@ -155,83 +180,165 @@ function mms_add_duplicate_button_on_edit_screen($post) {
 add_action('edit_form_after_title', 'mms_show_original_post_type_info');
 function mms_show_original_post_type_info($post) {
     if ($post->post_type === 'synced_post') {
-        $original_post_type = get_field('original_post_type_slug', $post->ID);
+        $original_post_type = mms_get_field('original_post_type_slug', $post->ID);
+        $post_type_label = $original_post_type ? mms_get_field('original_post_type_title', $post->ID) : 'Entrada';
         if (!$original_post_type) {
             $original_post_type = 'post';
         }
-        $post_type_label = get_field('original_post_type_slug', $post->ID) ? get_field('original_post_type_title', $post->ID) : 'Entrada';
 
         echo '<div style="margin: 24px 0 16px 0; padding: 16px; background: #f1f8ff; border-left: 6px solid #0073aa; font-size: 1.7em; font-weight: bold; color: #0073aa;">Tipo de publicación: ' . esc_html($post_type_label) . ' <span style="font-size:0.7em;color:#555;">(' . esc_html($original_post_type) . ')</span></div>';
     }
 }
 
 function duplicate_attachment($attachment_id, $target_site_id = null) {
+    $attachment_id = (int) $attachment_id;
+    if (!$attachment_id) {
+        return false;
+    }
+
+    // Quien llama ya suele estar en el sitio destino
+    $target_blog_id = $target_site_id ? (int) $target_site_id : get_current_blog_id();
+    $can_share = mms_offload_table_exists($target_blog_id);
+
     switch_to_blog(get_main_site_id());
     $attachment = get_post($attachment_id);
-    $file_path  = $attachment ? get_attached_file($attachment_id) : '';
+    $shared = false;
+    $source = false;
+    if ($attachment && $attachment->post_type === 'attachment') {
+        // En el bucket común: se comparte el objeto, sin copiar el archivo.
+        // Si no está en el bucket (o el destino no tiene Offload): copia física.
+        $shared = $can_share ? mms_offload_get_share_data($attachment) : false;
+        if (!$shared) {
+            $source = mms_get_attachment_source($attachment_id);
+        }
+    }
     // Volver siempre al blog de partida: antes el return sin restore y el
     // switch_to_blog() anidado dejaban la pila de blogs desequilibrada y el resto
     // de la petición seguía ejecutándose en el sitio equivocado.
     restore_current_blog();
 
-    if (!$attachment) {
+    if (!$shared && !$source) {
         return false;
     }
 
-    // Quien llama ya está en el sitio destino; si no coincide, cambiar y volver al final.
-    $switched = $target_site_id && (int) $target_site_id !== get_current_blog_id();
+    $switched = $target_blog_id !== get_current_blog_id();
     if ($switched) {
-        switch_to_blog($target_site_id);
+        switch_to_blog($target_blog_id);
     }
-    $new_attachment_id = mms_copy_attachment_file($file_path);
+
+    $new_attachment_id = false;
+    if ($shared) {
+        $new_attachment_id = mms_offload_create_shared_attachment($shared);
+    }
+    if (!$new_attachment_id && $source) {
+        $new_attachment_id = mms_copy_attachment_file($source['path'], $source['name']);
+    }
+
     if ($switched) {
         restore_current_blog();
+    }
+
+    if ($source && $source['temp']) {
+        @unlink($source['path']);
     }
 
     return $new_attachment_id;
 }
 
 /**
- * Copia el archivo al uploads del sitio actual y crea su attachment.
+ * Archivo de origen de un attachment del sitio actual, listo para copiar.
+ *
+ * Con Offload Media activo, get_attached_file() filtrado devuelve la URL del bucket
+ * y file_exists() fallaba: la media se perdía sin avisar. Se usa la ruta local sin
+ * filtrar y, si el archivo ya no está en disco (quitado del servidor tras subirlo),
+ * se descarga a un temporal desde la URL del bucket.
+ *
+ * @return array|false array('path' => ruta local, 'name' => nombre de archivo, 'temp' => bool)
  */
-function mms_copy_attachment_file($file_path) {
+function mms_get_attachment_source($attachment_id) {
+    $local = get_attached_file($attachment_id, true);
+    if ($local && file_exists($local)) {
+        return array('path' => $local, 'name' => basename($local), 'temp' => false);
+    }
 
-    if (!file_exists($file_path)) {
+    // La URL del item se lee de la tabla del sitio actual: tras un switch_to_blog(),
+    // wp_get_attachment_url() de Offload puede resolver contra la tabla de otro sitio.
+    $row = mms_offload_get_row($attachment_id);
+    $url = $row ? $row['url'] : wp_get_attachment_url($attachment_id);
+    if (!$url) {
+        return false;
+    }
+
+    if (!function_exists('download_url')) {
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+    }
+    $tmp = download_url($url, 60);
+    if (is_wp_error($tmp)) {
+        error_log('[MMS] No se pudo descargar el adjunto ' . $attachment_id . ': ' . $tmp->get_error_message());
+        return false;
+    }
+
+    $name = $local ? basename($local) : basename(wp_parse_url($url, PHP_URL_PATH));
+    return array('path' => $tmp, 'name' => $name, 'temp' => true);
+}
+
+/**
+ * Copia el archivo al uploads del sitio actual y crea su attachment.
+ *
+ * @param string $file_path Ruta local del archivo de origen.
+ * @param string $name      Nombre de archivo de destino (por defecto, el del origen).
+ */
+function mms_copy_attachment_file($file_path, $name = '') {
+
+    if (!$file_path || !file_exists($file_path)) {
         return false;
     }
     // Copiar el archivo a la carpeta de uploads del sitio actual
     $upload_dir = wp_upload_dir();
-    $filename = wp_unique_filename($upload_dir['path'], basename($file_path));
+    if (!empty($upload_dir['error'])) {
+        return false;
+    }
+    $filename = wp_unique_filename($upload_dir['path'], sanitize_file_name($name ?: basename($file_path)));
     $new_file = $upload_dir['path'] . '/' . $filename;
 
-    if (copy($file_path, $new_file)) {
-        // Crear attachment en el subsitio
-        $filetype = wp_check_filetype($filename, null);
-        $attachment_data = array(
-            'post_mime_type' => $filetype['type'],
-            'post_title'     => sanitize_file_name($filename),
-            'post_content'   => '',
-            'post_status'    => 'inherit'
-        );
-        $new_attachment_id = wp_insert_attachment($attachment_data, $new_file);
-
-        if ( ! defined( 'ABSPATH' ) ) {
-            define( 'ABSPATH', dirname( __FILE__, 4 ) . '/' );
-        }
-        require_once( ABSPATH . 'wp-admin/includes/image.php' );
-        require_once( ABSPATH . 'wp-admin/includes/media.php' );
-        require_once( ABSPATH . 'wp-admin/includes/file.php' );
-        // Para videos (mp4), asegurar que la función wp_read_video_metadata esté disponible
-        if ( ! function_exists( 'wp_read_video_metadata' ) ) {
-            require_once( ABSPATH . 'wp-admin/includes/media.php' );
-        }
-        $attach_data = wp_generate_attachment_metadata($new_attachment_id, $new_file);
-        wp_update_attachment_metadata($new_attachment_id, $attach_data);
-
-        return $new_attachment_id;
+    if (!@copy($file_path, $new_file)) {
+        return false;
     }
 
-    return false;
+    // Tras un switch_to_blog(), Offload guardaría el item en la tabla de otro sitio
+    $suspended = mms_offload_suspend_upload();
+    $new_attachment_id = mms_create_attachment_from_file($new_file, $filename);
+    if ($suspended) {
+        mms_offload_resume_upload();
+    }
+
+    return $new_attachment_id;
+}
+
+/**
+ * Crea el attachment del archivo ya copiado en el uploads del sitio actual.
+ */
+function mms_create_attachment_from_file($new_file, $filename) {
+    $filetype = wp_check_filetype($filename, null);
+    $attachment_data = array(
+        'post_mime_type' => $filetype['type'],
+        'post_title'     => sanitize_file_name($filename),
+        'post_content'   => '',
+        'post_status'    => 'inherit'
+    );
+    $new_attachment_id = wp_insert_attachment($attachment_data, $new_file);
+    if (!$new_attachment_id || is_wp_error($new_attachment_id)) {
+        @unlink($new_file);
+        return false;
+    }
+
+    require_once( ABSPATH . 'wp-admin/includes/image.php' );
+    require_once( ABSPATH . 'wp-admin/includes/media.php' );
+    require_once( ABSPATH . 'wp-admin/includes/file.php' );
+    $attach_data = wp_generate_attachment_metadata($new_attachment_id, $new_file);
+    wp_update_attachment_metadata($new_attachment_id, $attach_data);
+
+    return $new_attachment_id;
 }
 
 function mms_duplicate_acf_media_recursive($field_value, $field_object) {
@@ -314,21 +421,37 @@ function mms_duplicate_acf_media_recursive($field_value, $field_object) {
 add_action('admin_post_mms_duplicate_post', 'mms_handle_duplicate_action');
 
 function mms_handle_duplicate_action() {
-    if (!current_user_can('edit_posts')) {
-        wp_die('No tienes permisos suficientes.');
-    }
-    
-    // Verificar el nonce de seguridad
-    if (!isset($_GET['post_id']) || !isset($_GET['_wpnonce']) || !wp_verify_nonce($_GET['_wpnonce'], 'mms_duplicate_nonce')) {
+    $synced_post_id = isset($_GET['post_id']) ? (int) $_GET['post_id'] : 0;
+
+    // Verificar el nonce de seguridad (ligado al post)
+    if (!$synced_post_id || !isset($_GET['_wpnonce']) || !wp_verify_nonce($_GET['_wpnonce'], 'mms_duplicate_nonce_' . $synced_post_id)) {
         wp_die('Error de seguridad.');
     }
 
-    $synced_post_id = intval($_GET['post_id']);
-    $original_post_id = get_field('original_post_id', $synced_post_id);
-    
+    // Crea contenido publicado y borra el synced_post: hace falta poder publicar y
+    // borrar esa entrada. Antes bastaba 'edit_posts' (colaboradores incluidos).
+    if (!current_user_can('publish_posts') || !current_user_can('delete_post', $synced_post_id)) {
+        wp_die('No tienes permisos suficientes.');
+    }
+
+    // Solo synced_post: antes se aceptaba cualquier ID y se borraba ese post al final
+    $synced_post = get_post($synced_post_id);
+    if (!$synced_post || $synced_post->post_type !== 'synced_post') {
+        wp_die('La entrada indicada no es un contenido sincronizado.');
+    }
+
+    $original_post_id = (int) mms_get_field('original_post_id', $synced_post_id);
+    if (!$original_post_id) {
+        wp_die('La entrada sincronizada no tiene contenido original asociado.');
+    }
+
     // Obtener el contenido del post original del sitio principal
     switch_to_blog(get_main_site_id());
     $original_post = get_post($original_post_id);
+    if (!$original_post) {
+        restore_current_blog();
+        wp_die('El post original no fue encontrado.');
+    }
 
     // Obtener taxonomías y términos asociados
     $taxonomies = get_object_taxonomies($original_post->post_type);
@@ -347,47 +470,21 @@ function mms_handle_duplicate_action() {
         $acf_fields = array();
     }
 
-    // Duplicar imagen destacada si existe
-    $new_thumbnail_id = false;
-    if (has_post_thumbnail($original_post_id)) {
-        $thumbnail_id = get_post_thumbnail_id($original_post_id);
-        $thumbnail = get_post($thumbnail_id);
-
-        // Obtener la ruta del archivo en el sitio principal
-        $thumbnail_path = get_attached_file($thumbnail_id);
-
-        // Copiar el archivo a la carpeta de uploads del sitio actual
-        restore_current_blog(); // Volver al subsitio antes de manipular uploads
-
-        $upload_dir = wp_upload_dir();
-        $filename = wp_unique_filename($upload_dir['path'], basename($thumbnail_path));
-        $new_file = $upload_dir['path'] . '/' . $filename;
-
-        if (copy($thumbnail_path, $new_file)) {
-            // Crear attachment en el subsitio
-            $filetype = wp_check_filetype($filename, null);
-            $attachment = array(
-                'post_mime_type' => $filetype['type'],
-                'post_title'     => sanitize_file_name($filename),
-                'post_content'   => '',
-                'post_status'    => 'inherit'
-            );
-            $new_thumbnail_id = wp_insert_attachment($attachment, $new_file);
-
-            require_once(ABSPATH . 'wp-admin/includes/image.php');
-            $attach_data = wp_generate_attachment_metadata($new_thumbnail_id, $new_file);
-            wp_update_attachment_metadata($new_thumbnail_id, $attach_data);
+    // Precalcular los objetos de campo ACF en el principal (evita un switch por campo)
+    $acf_field_objects = array();
+    if (!empty($acf_fields) && function_exists('get_field_object')) {
+        foreach ($acf_fields as $field_key => $field_value) {
+            $acf_field_objects[$field_key] = get_field_object($field_key, $original_post_id);
         }
-    } else {
-        restore_current_blog();
     }
 
-    
-    
-    if (!$original_post) {
-        wp_die('El post original no fue encontrado.');
-    }
-    
+    $thumbnail_id = get_post_thumbnail_id($original_post_id);
+
+    restore_current_blog(); // Volver al subsitio
+
+    // Duplicar imagen destacada (duplicate_attachment soporta archivos en Offload Media)
+    $new_thumbnail_id = $thumbnail_id ? duplicate_attachment($thumbnail_id) : false;
+
     // Crear la nueva entrada en el subsitio actual, duplicando también la fecha de creación y publicando
     $new_post_args = array(
         'post_title'   => $original_post->post_title,
@@ -397,7 +494,10 @@ function mms_handle_duplicate_action() {
         'post_date'    => $original_post->post_date,
         'post_date_gmt'=> $original_post->post_date_gmt,
     );
-    $new_post_id = wp_insert_post($new_post_args);
+    $new_post_id = wp_insert_post($new_post_args, true);
+    if (is_wp_error($new_post_id) || !$new_post_id) {
+        wp_die('No se pudo crear el contenido: ' . (is_wp_error($new_post_id) ? esc_html($new_post_id->get_error_message()) : 'error desconocido'));
+    }
 
     // Asignar imagen destacada duplicada si existe
     if ($new_thumbnail_id) {
@@ -415,10 +515,8 @@ function mms_handle_duplicate_action() {
     // Duplicar y asignar archivos/media de campos ACF tipo file, image, gallery
     if (!empty($acf_fields) && function_exists('update_field')) {
         foreach ($acf_fields as $field_key => $field_value) {
-            switch_to_blog(get_main_site_id());
-                $field_object = get_field_object($field_key, $original_post_id);
-            restore_current_blog();
-            
+            $field_object = isset($acf_field_objects[$field_key]) ? $acf_field_objects[$field_key] : false;
+
             if (!$field_object) {
                 update_field($field_key, $field_value, $new_post_id);
                 continue;
@@ -469,8 +567,8 @@ function mms_enqueue_duplicate_scripts($hook) {
         return;
     }
     
-    wp_enqueue_script('mms-duplicate-script', plugin_dir_url(__FILE__) . 'js/duplicate-admin.js', array('jquery'), '1.1.0', true);
-    wp_enqueue_style('mms-duplicate-style', plugin_dir_url(__FILE__) . 'css/duplicate-admin.css', array(), '1.1.0');
+    wp_enqueue_script('mms-duplicate-script', plugin_dir_url(__FILE__) . 'js/duplicate-admin.js', array('jquery'), MMS_VERSION, true);
+    wp_enqueue_style('mms-duplicate-style', plugin_dir_url(__FILE__) . 'css/duplicate-admin.css', array(), MMS_VERSION);
     
     // Localize script with AJAX data
     wp_localize_script('mms-duplicate-script', 'mms_ajax', array(
@@ -766,8 +864,13 @@ function mms_duplicate_content_to_site($post_id, $target_site_id) {
         return $new_post_id;
     }
 
-    // Copiar meta del post
+    // Copiar meta del post, salvo la que solo tiene sentido en el sitio de origen
+    // (IDs de otro sitio, bloqueos de edición, estado de tic-sync)
+    $skip_meta = array('_thumbnail_id', '_edit_lock', '_edit_last', '_wp_old_slug', '_tic_remote_id', '_tic_sync_pending');
     foreach ($post_meta as $meta_key => $meta_values) {
+        if (in_array($meta_key, $skip_meta, true)) {
+            continue;
+        }
         foreach ($meta_values as $meta_value) {
             add_post_meta($new_post_id, $meta_key, maybe_unserialize($meta_value));
         }
@@ -793,10 +896,11 @@ function mms_duplicate_content_to_site($post_id, $target_site_id) {
     // Duplicar y asignar archivos/media de campos ACF tipo file, image, gallery
     if (!empty($acf_fields) && function_exists('update_field')) {
         foreach ($acf_fields as $field_key => $field_value) {
-            switch_to_blog(get_main_site_id());
-                $field_object = get_field_object($field_key, $post_id);
-            switch_to_blog($target_site_id);
-            
+            // Calculados antes de cambiar de blog. Antes se hacía switch_to_blog(main) +
+            // switch_to_blog(target) por campo, sin restore: la pila de blogs crecía y
+            // ms_is_switched() seguía a true el resto de la petición.
+            $field_object = isset($acf_field_objects[$field_key]) ? $acf_field_objects[$field_key] : false;
+
             if (!$field_object) {
                 update_field($field_key, $field_value, $new_post_id);
                 continue;
