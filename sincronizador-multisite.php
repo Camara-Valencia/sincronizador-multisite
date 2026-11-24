@@ -2,7 +2,7 @@
 /*
 Plugin Name: Sincronizador Multisite
 Description: Sincroniza entradas entre el sitio principal y los subsitios.
-Version: 1.1.1
+Version: 1.2.0
 Author: Tu Nombre
 Network: true
 */
@@ -10,7 +10,7 @@ Network: true
 // Evita el acceso directo
 defined( 'ABSPATH' ) || exit;
 
-define('MMS_VERSION', '1.1.1');
+define('MMS_VERSION', '1.2.0');
 
 /**
  * Lee un campo ACF; si ACF no está cargado, lee la meta directamente
@@ -32,6 +32,9 @@ require_once plugin_dir_path(__FILE__) . 'includes/network-settings.php';
 
 // Media compartida en el bucket común (Offload Media) y correcciones de Offload en multisite
 require_once plugin_dir_path(__FILE__) . 'includes/offload-compat.php';
+
+// Borrado de synced_post al despublicar el original y limpieza de huérfanos
+require_once plugin_dir_path(__FILE__) . 'includes/cleanup.php';
 
 // Hook para crear el post type personalizado
 add_action('init', 'mms_register_synced_post_type');

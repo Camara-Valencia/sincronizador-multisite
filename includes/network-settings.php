@@ -215,6 +215,8 @@ function mms_render_network_settings_page() {
                 <?php submit_button('Guardar cambios'); ?>
             </form>
         <?php endif; ?>
+
+        <?php if (function_exists('mms_render_cleanup_section')) { mms_render_cleanup_section(); } ?>
     </div>
 
     <style>
