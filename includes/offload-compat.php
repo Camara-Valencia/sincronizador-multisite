@@ -12,10 +12,13 @@
  *    compartidos, borrar una copia (o el original) dejaba sin imagen al resto de sitios.
  *
  * 2. switch_to_blog(): la tabla de items es una constante (ACOOFM_ITEM_TABLE) fijada con
- *    el prefijo del sitio de la petición. Tras un switch_to_blog() Offload busca el ID de
- *    un attachment del otro sitio en la tabla equivocada: puede devolver la URL de OTRA
- *    imagen y guardarla en la caché del otro sitio (24 h). Antes de que Offload lea, se
- *    deja en su caché el item correcto, leído de la tabla del sitio actual.
+ *    el prefijo del sitio de la petición. Este plugin lee siempre la tabla del sitio
+ *    actual (mms_offload_get_row) y no usa las funciones de Offload tras un switch.
+ *
+ *    1.1.1: se retira el cebado de la caché de Offload en las lecturas del front tras
+ *    switch_to_blog() (1.1.0). Reescribía una transient grande del blog 1 por imagen
+ *    desde cada subsitio; con las cachés purgadas y tráfico, las escrituras concurrentes
+ *    sobre la misma fila bloqueaban MySQL y los subsitios daban 504.
  */
 
 defined('ABSPATH') || exit;
@@ -89,67 +92,6 @@ function mms_offload_get_row($attachment_id) {
 
     return $row ?: false;
 }
-
-/* -------------------------------------------------------------------------
- * Lecturas tras switch_to_blog(): dejar en la caché de Offload el item correcto
- * ---------------------------------------------------------------------- */
-
-function mms_offload_prime_cache($attachment_id) {
-    $attachment_id = (int) $attachment_id;
-    if (!$attachment_id || !ms_is_switched() || !mms_offload_context_mismatch()) {
-        return;
-    }
-
-    static $done = array();
-    $key = get_current_blog_id() . ':' . $attachment_id;
-    if (isset($done[$key])) {
-        return;
-    }
-    $done[$key] = true;
-
-    // Sin item enlazado, Offload no consulta su tabla: nada que corregir
-    $item_id = (int) get_post_meta($attachment_id, mms_offload_meta_key(), true);
-    if (!$item_id) {
-        return;
-    }
-
-    // Si la caché ya tiene el item enlazado, es el correcto: sin consultas ni escrituras
-    $cached = acoofm_get_cache($attachment_id, $attachment_id);
-    if (is_array($cached) && isset($cached['id']) && (int) $cached['id'] === $item_id) {
-        return;
-    }
-
-    $row = mms_offload_get_row($attachment_id);
-    if ($row) {
-        acoofm_set_cache($attachment_id, $row, $attachment_id);
-    }
-}
-
-function mms_offload_prime_by_id_arg2($value, $attachment_id) {
-    mms_offload_prime_cache($attachment_id);
-    return $value;
-}
-
-function mms_offload_prime_srcset($sources, $size_array, $image_src, $image_meta, $attachment_id = 0) {
-    mms_offload_prime_cache($attachment_id);
-    return $sources;
-}
-
-function mms_offload_prime_by_post_arg2($value, $attachment) {
-    if ($attachment instanceof WP_Post) {
-        mms_offload_prime_cache($attachment->ID);
-    }
-    return $value;
-}
-
-// Prioridad 1: antes que los filtros de Offload (10 y 99)
-add_filter('wp_get_attachment_url', 'mms_offload_prime_by_id_arg2', 1, 2);
-add_filter('get_attached_file', 'mms_offload_prime_by_id_arg2', 1, 2);
-add_filter('wp_get_original_image_path', 'mms_offload_prime_by_id_arg2', 1, 2);
-add_filter('image_downsize', 'mms_offload_prime_by_id_arg2', 1, 2);
-add_filter('wp_calculate_image_srcset', 'mms_offload_prime_srcset', 1, 5);
-add_filter('wp_get_attachment_image_attributes', 'mms_offload_prime_by_post_arg2', 1, 2);
-add_filter('wp_prepare_attachment_for_js', 'mms_offload_prime_by_post_arg2', 1, 2);
 
 /* -------------------------------------------------------------------------
  * Attachments compartidos entre sitios

@@ -2,7 +2,7 @@
 /*
 Plugin Name: Sincronizador Multisite
 Description: Sincroniza entradas entre el sitio principal y los subsitios.
-Version: 1.1.0
+Version: 1.1.1
 Author: Tu Nombre
 Network: true
 */
@@ -10,7 +10,7 @@ Network: true
 // Evita el acceso directo
 defined( 'ABSPATH' ) || exit;
 
-define('MMS_VERSION', '1.1.0');
+define('MMS_VERSION', '1.1.1');
 
 /**
  * Lee un campo ACF; si ACF no está cargado, lee la meta directamente
