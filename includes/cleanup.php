@@ -9,11 +9,13 @@
  *
  * 2. Limpieza de huérfanos (Red → Ajustes → Sincronización, o `wp mms limpiar-sincronizados`):
  *    borra los synced_post que no tienen original, cuyo original ya no existe o no está
- *    publicado (p. ej. los creados antes de la 1.1.0 por los borradores de la IA), y los
- *    duplicados del mismo original en un mismo sitio.
+ *    publicado (p. ej. los creados antes de la 1.1.0 por los borradores de la IA), los que
+ *    el subsitio ya tiene como contenido propio (1.3.0) y los duplicados del mismo original
+ *    en un mismo sitio.
  *
- * No se tocan los synced_post en borrador o papelera cuyo original sigue publicado:
- * puede que alguien los haya ocultado a propósito en ese subsitio.
+ * No se tocan los synced_post en borrador o papelera cuyo original sigue publicado (salvo
+ * que el subsitio ya tenga el contenido propio): puede que alguien los haya ocultado a
+ * propósito en ese subsitio.
  */
 
 defined('ABSPATH') || exit;
@@ -43,6 +45,104 @@ function mms_find_synced_posts_for_original($blog_id, $original_post_id) {
 }
 
 /**
+ * Condición SQL de "contenido local" de un subsitio: ni synced_post ni tipos internos,
+ * en un estado que cuenta como existente.
+ */
+function mms_local_content_sql($alias = 'p') {
+    return "{$alias}.post_type NOT IN ('synced_post', 'revision', 'attachment', 'nav_menu_item')
+        AND {$alias}.post_status NOT IN ('trash', 'auto-draft', 'inherit')";
+}
+
+/**
+ * ID del contenido local de un subsitio que ya es el original: marcado con
+ * MMS_LOCAL_COPY_META ("Duplicar" / "Duplicar en") o con el mismo tipo y slug
+ * (copias anteriores a la marca o creadas a mano).
+ *
+ * @return int 0 si no hay
+ */
+function mms_find_local_copy($blog_id, $original_post_id, $post_type, $post_name) {
+    global $wpdb;
+
+    $prefix = $wpdb->get_blog_prefix($blog_id);
+    $local  = mms_local_content_sql('p');
+
+    $sql  = "SELECT p.ID FROM {$prefix}posts p WHERE {$local} AND (
+                p.ID IN (SELECT post_id FROM {$prefix}postmeta WHERE meta_key = %s AND meta_value = %s)";
+    $args = array(MMS_LOCAL_COPY_META, (string) (int) $original_post_id);
+
+    if ($post_name !== '') {
+        $sql   .= ' OR (p.post_type = %s AND p.post_name = %s)';
+        $args[] = $post_type;
+        $args[] = $post_name;
+    }
+
+    $sql .= ') LIMIT 1';
+
+    return (int) $wpdb->get_var($wpdb->prepare($sql, $args));
+}
+
+/**
+ * Originales que un subsitio ya tiene como contenido propio, entre los indicados.
+ *
+ * @param array $originals original_id => array( 'type' => post_type, 'name' => post_name )
+ * @return array<int, true> original_id => true
+ */
+function mms_find_local_copies_bulk($blog_id, array $originals) {
+    global $wpdb;
+
+    if (!$originals) {
+        return array();
+    }
+
+    $prefix = $wpdb->get_blog_prefix($blog_id);
+    $local  = mms_local_content_sql('p');
+    $found  = array();
+
+    // Marcados por el plugin
+    $marked = $wpdb->get_col($wpdb->prepare(
+        "SELECT m.meta_value FROM {$prefix}postmeta m
+           INNER JOIN {$prefix}posts p ON p.ID = m.post_id
+          WHERE m.meta_key = %s AND {$local}",
+        MMS_LOCAL_COPY_META
+    ));
+    foreach ($marked as $original_id) {
+        if (isset($originals[(int) $original_id])) {
+            $found[(int) $original_id] = true;
+        }
+    }
+
+    // Mismo tipo y slug
+    $by_slug = array();
+    foreach ($originals as $original_id => $o) {
+        if ($o['name'] !== '' && !isset($found[$original_id])) {
+            $by_slug[$o['type'] . '|' . $o['name']] = $original_id;
+        }
+    }
+
+    foreach (array_chunk(array_keys($by_slug), 500) as $chunk) {
+        $names = array_map(function ($key) {
+            return substr($key, strpos($key, '|') + 1);
+        }, $chunk);
+        $placeholders = implode(',', array_fill(0, count($names), '%s'));
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT p.post_type, p.post_name FROM {$prefix}posts p
+              WHERE p.post_name IN ({$placeholders}) AND {$local}",
+            $names
+        ), ARRAY_A);
+
+        foreach ($rows as $row) {
+            $key = $row['post_type'] . '|' . $row['post_name'];
+            if (isset($by_slug[$key])) {
+                $found[$by_slug[$key]] = true;
+            }
+        }
+    }
+
+    return $found;
+}
+
+/**
  * synced_post sobrantes de un subsitio, con el motivo.
  *
  * @return array<int, string> ID del synced_post => motivo
@@ -54,7 +154,7 @@ function mms_find_orphan_synced_posts($blog_id) {
     $main_prefix = $wpdb->get_blog_prefix(get_main_site_id());
 
     $rows = $wpdb->get_results(
-        "SELECT p.ID, p.post_status, m.meta_value AS original_id, o.ID AS o_id, o.post_status AS o_status, o.post_type AS o_type
+        "SELECT p.ID, p.post_status, m.meta_value AS original_id, o.ID AS o_id, o.post_status AS o_status, o.post_type AS o_type, o.post_name AS o_name
            FROM {$prefix}posts p
            LEFT JOIN {$prefix}postmeta m ON m.post_id = p.ID AND m.meta_key = 'original_post_id'
            LEFT JOIN {$main_prefix}posts o ON o.ID = CAST(m.meta_value AS UNSIGNED)
@@ -62,6 +162,15 @@ function mms_find_orphan_synced_posts($blog_id) {
           ORDER BY p.ID ASC",
         ARRAY_A
     );
+
+    // Originales publicados que el subsitio ya tiene como contenido propio
+    $originals = array();
+    foreach ($rows as $row) {
+        if ($row['o_id'] && $row['o_status'] === 'publish') {
+            $originals[(int) $row['o_id']] = array('type' => $row['o_type'], 'name' => (string) $row['o_name']);
+        }
+    }
+    $local_copies = mms_find_local_copies_bulk($blog_id, $originals);
 
     $orphans = array();
     $kept    = array(); // original_id => synced_post que se conserva
@@ -80,6 +189,8 @@ function mms_find_orphan_synced_posts($blog_id) {
             $orphans[$id] = 'original_borrado';
         } elseif ($row['o_status'] !== 'publish') {
             $orphans[$id] = 'original_no_publicado';
+        } elseif (isset($local_copies[$original_id])) {
+            $orphans[$id] = 'ya_en_local';
         } elseif (isset($kept[$original_id])) {
             $orphans[$id] = 'duplicado';
         } else {
@@ -183,6 +294,7 @@ function mms_cleanup_reason_labels() {
         'sin_original'          => 'Sin original',
         'original_borrado'      => 'Original borrado',
         'original_no_publicado' => 'Original no publicado',
+        'ya_en_local'           => 'Ya existe en local',
         'duplicado'             => 'Duplicado',
     );
 }
@@ -260,7 +372,8 @@ function mms_render_cleanup_section() {
     <h2 id="mms-limpieza">Limpieza de posts sincronizados</h2>
     <p>
         Busca en los subsitios los <code>synced_post</code> que sobran: sin original, con el original
-        borrado o sin publicar (p. ej. borradores de la IA) y duplicados del mismo original.
+        borrado o sin publicar (p. ej. borradores de la IA), los que el subsitio ya tiene como
+        contenido propio (mismo tipo y slug, o convertido con "Duplicar") y duplicados del mismo original.
         Los que están en borrador o en la papelera con el original publicado no se tocan.
     </p>
 

@@ -82,6 +82,64 @@ function mms_get_syncable_post_types() {
     return $post_types;
 }
 
+/* -------------------------------------------------------------------------
+ * Migración desde la versión original (1.0)
+ * ---------------------------------------------------------------------- */
+
+const MMS_SYNC_MIGRATED_OPTION = 'mms_sync_matrix_migrated';
+
+/**
+ * Tipos que la 1.0 sincronizaba siempre (lista fija en el código).
+ */
+function mms_legacy_sync_post_types() {
+    return array(
+        'post', 'caso-de-exito', 'evento', 'guia-o-manual-practi', 'infografia',
+        'informe-o-estudio', 'partner', 'plantilla-descargabl', 'podcast', 'recurso',
+        'servicio', 'solucion', 'tendencia', 'video', 'webinar',
+    );
+}
+
+/**
+ * Si la matriz no existe todavía, se rellena con lo que hacía la 1.0: la lista fija menos
+ * los tipos marcados en la opción ACF 'post_types_no_duplicate' de cada subsitio.
+ * Sin esto, al desplegar la matriz vacía se paraba la sincronización en todos los subsitios.
+ *
+ * La opción ACF no se borra: los temas de los subsitios también la usan para ocultar
+ * tipos de contenido en el admin.
+ */
+function mms_maybe_migrate_sync_matrix() {
+    if (!is_multisite() || !is_main_site()) {
+        return;
+    }
+
+    // Ya existe (guardada desde la red o migrada antes): no tocar
+    if (get_site_option(MMS_SYNC_MATRIX_OPTION, null) !== null) {
+        return;
+    }
+
+    // Solo los tipos registrados en el principal (este hook va después de registrar los CPT)
+    $post_types = array_values(array_filter(mms_legacy_sync_post_types(), 'post_type_exists'));
+
+    $matrix = array();
+    foreach (mms_get_sync_subsites() as $site) {
+        $blog_id = (int) $site->blog_id;
+
+        // ACF guarda los campos de la página de opciones como 'options_<nombre>'
+        $excluded = get_blog_option($blog_id, 'options_post_types_no_duplicate', array());
+        $excluded = is_array($excluded) ? $excluded : ($excluded ? array($excluded) : array());
+
+        $types = array_values(array_diff($post_types, $excluded));
+        if ($types) {
+            $matrix[$blog_id] = $types;
+        }
+    }
+
+    update_site_option(MMS_SYNC_MATRIX_OPTION, $matrix);
+    update_site_option(MMS_SYNC_MIGRATED_OPTION, time());
+}
+// En 'init' y no en 'admin_init': los guardados por REST (editor de bloques, IA) no pasan por admin_init
+add_action('init', 'mms_maybe_migrate_sync_matrix', 99);
+
 add_action('network_admin_menu', 'mms_register_network_settings_page');
 
 function mms_register_network_settings_page() {
@@ -125,6 +183,7 @@ function mms_save_network_settings() {
     }
 
     update_site_option(MMS_SYNC_MATRIX_OPTION, $matrix);
+    delete_site_option(MMS_SYNC_MIGRATED_OPTION); // revisada: fuera el aviso de migración
 
     wp_safe_redirect(add_query_arg(
         array('page' => MMS_SYNC_SETTINGS_PAGE, 'updated' => 'true'),
@@ -147,6 +206,18 @@ function mms_render_network_settings_page() {
 
         <?php if (isset($_GET['updated'])) : ?>
             <div class="notice notice-success is-dismissible"><p>Configuración guardada.</p></div>
+        <?php endif; ?>
+
+        <?php $migrated = (int) get_site_option(MMS_SYNC_MIGRATED_OPTION, 0); ?>
+        <?php if ($migrated) : ?>
+            <div class="notice notice-info inline">
+                <p>
+                    La matriz se rellenó automáticamente el
+                    <?php echo esc_html(wp_date(get_option('date_format') . ' H:i', $migrated)); ?>
+                    con la configuración anterior (tipos fijos de la versión 1.0 menos los excluidos en
+                    <code>post_types_no_duplicate</code> de cada subsitio). Revísala y guarda.
+                </p>
+            </div>
         <?php endif; ?>
 
         <p>

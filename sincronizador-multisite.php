@@ -2,7 +2,7 @@
 /*
 Plugin Name: Sincronizador Multisite
 Description: Sincroniza entradas entre el sitio principal y los subsitios.
-Version: 1.2.0
+Version: 1.3.0
 Author: Tu Nombre
 Network: true
 */
@@ -10,7 +10,11 @@ Network: true
 // Evita el acceso directo
 defined( 'ABSPATH' ) || exit;
 
-define('MMS_VERSION', '1.2.0');
+define('MMS_VERSION', '1.3.0');
+
+// Meta que marca, en un subsitio, el contenido local que viene de un original del
+// principal ("Duplicar" o "Duplicar en"). Valor: ID del original.
+define('MMS_LOCAL_COPY_META', '_mms_original_post_id');
 
 /**
  * Lee un campo ACF; si ACF no está cargado, lee la meta directamente
@@ -79,50 +83,54 @@ function mms_sync_post_to_sites($post_id, $post) {
     }
 
     // Subsitios configurados para este tipo de contenido en
-    // Administración de la red → Ajustes → Sincronización. Por defecto, ninguno.
+    // Administración de la red → Ajustes → Sincronización.
     $target_sites = mms_get_sync_target_sites($post->post_type);
     if (empty($target_sites)) {
         return;
     }
 
-    $title_object_post_type = get_post_type_title_by_id($post_id);
-    $original_post_type_slug = $title_object_post_type->slug;
-    $original_post_type_title = $title_object_post_type->title;
+    // Solo subsitios activos (la matriz puede conservar sitios archivados o borrados después)
+    $valid_sites = array_map('intval', wp_list_pluck(mms_get_sync_subsites(), 'blog_id'));
+
+    $type_info = null;
 
     foreach ($target_sites as $site_id) {
-        if ($site_id === get_current_blog_id() || !get_site($site_id)) {
+        if (!in_array($site_id, $valid_sites, true)) {
             continue;
+        }
+
+        // Las comprobaciones son consultas directas: solo se cambia de blog si hay que crear algo.
+        // Antes se hacía switch_to_blog() + meta_query en cada subsitio en cada guardado.
+
+        // Ya tiene synced_post en cualquier estado. Incluye la papelera: si un subsitio lo
+        // ocultó a propósito no se vuelve a crear (antes 'any' excluía la papelera).
+        if (mms_find_synced_posts_for_original($site_id, $post_id)) {
+            continue;
+        }
+
+        // Ya tiene el contenido como propio: convertido con "Duplicar", copiado con
+        // "Duplicar en" o creado a mano con el mismo tipo y slug. Antes se le volvía a
+        // crear un synced_post y el contenido salía dos veces en el subsitio.
+        if (mms_find_local_copy($site_id, $post_id, $post->post_type, $post->post_name)) {
+            continue;
+        }
+
+        if ($type_info === null) {
+            $type_info = get_post_type_title_by_id($post_id);
         }
 
         switch_to_blog($site_id);
 
-        // Comprobar si ya existe un post sincronizado para el post original
-        $existing_posts = get_posts(array(
+        $new_post_id = wp_insert_post(array(
+            'post_title'  => $post->post_title,
             'post_type'   => 'synced_post',
-            'post_status' => 'any',
-            'fields'      => 'ids',
-            'numberposts' => 1,
-            'meta_query'  => array(
-                array(
-                    'key'   => 'original_post_id',
-                    'value' => $post_id,
-                ),
-            ),
+            'post_status' => 'publish',
         ));
 
-        if (empty($existing_posts)) {
-            // Crear el post sincronizado con el ID original
-            $new_post_id = wp_insert_post(array(
-                'post_title'  => $post->post_title,
-                'post_type'   => 'synced_post',
-                'post_status' => 'publish',
-            ));
-
-            if ($new_post_id && !is_wp_error($new_post_id)) {
-                mms_update_field('original_post_id', $post_id, $new_post_id);
-                mms_update_field('original_post_type_slug', $original_post_type_slug, $new_post_id);
-                mms_update_field('original_post_type_title', $original_post_type_title, $new_post_id);
-            }
+        if ($new_post_id && !is_wp_error($new_post_id)) {
+            mms_update_field('original_post_id', $post_id, $new_post_id);
+            mms_update_field('original_post_type_slug', $type_info->slug, $new_post_id);
+            mms_update_field('original_post_type_title', $type_info->title, $new_post_id);
         }
 
         restore_current_blog();
@@ -531,8 +539,11 @@ function mms_handle_duplicate_action() {
         }
     }
 
-    // Eliminar el post sincronizado
-    wp_delete_post($synced_post_id);
+    // Marcar la copia local: la sincronización ya no volverá a crear un synced_post aquí
+    update_post_meta($new_post_id, MMS_LOCAL_COPY_META, $original_post_id);
+
+    // Eliminar el post sincronizado (definitivamente: en la papelera no aporta nada)
+    wp_delete_post($synced_post_id, true);
     
     // Redirigir al usuario
     wp_redirect(admin_url('edit.php?post_type=' . $original_post->post_type));
@@ -704,18 +715,15 @@ function mms_duplicate_meta_box_callback($post) {
  * Handle duplicate content AJAX request
  */
 function mms_handle_duplicate_content_ajax() {
-    // Verify nonce
-    if (!wp_verify_nonce($_POST['nonce'], 'duplicate_content_nonce')) {
-        wp_die('Token de seguridad no válido.');
-    }
-    
+    check_ajax_referer('duplicate_content_nonce', 'nonce');
+
     // Solo desde el sitio principal y para superadministradores
     if (!mms_can_duplicate_to_sites()) {
         wp_send_json_error('Solo se puede duplicar contenido desde el sitio principal.');
     }
 
-    $post_id = (int) $_POST['post_id'];
-    $target_site_id = (int) $_POST['target_site_id'];
+    $post_id = isset($_POST['post_id']) ? (int) $_POST['post_id'] : 0;
+    $target_site_id = isset($_POST['target_site_id']) ? (int) $_POST['target_site_id'] : 0;
 
     // Validate post exists
     $post = get_post($post_id);
@@ -752,11 +760,8 @@ function mms_handle_duplicate_content_ajax() {
  * Get available sites for AJAX
  */
 function mms_get_available_sites_ajax() {
-    // Verify nonce
-    if (!wp_verify_nonce($_POST['nonce'], 'duplicate_content_nonce')) {
-        wp_die('Token de seguridad no válido.');
-    }
-    
+    check_ajax_referer('duplicate_content_nonce', 'nonce');
+
     // Solo desde el sitio principal y para superadministradores
     if (!mms_can_duplicate_to_sites()) {
         wp_send_json_error('Solo se puede duplicar contenido desde el sitio principal.');
@@ -869,7 +874,7 @@ function mms_duplicate_content_to_site($post_id, $target_site_id) {
 
     // Copiar meta del post, salvo la que solo tiene sentido en el sitio de origen
     // (IDs de otro sitio, bloqueos de edición, estado de tic-sync)
-    $skip_meta = array('_thumbnail_id', '_edit_lock', '_edit_last', '_wp_old_slug', '_tic_remote_id', '_tic_sync_pending');
+    $skip_meta = array('_thumbnail_id', '_edit_lock', '_edit_last', '_wp_old_slug', '_tic_remote_id', '_tic_sync_pending', MMS_LOCAL_COPY_META);
     foreach ($post_meta as $meta_key => $meta_values) {
         if (in_array($meta_key, $skip_meta, true)) {
             continue;
@@ -915,7 +920,13 @@ function mms_duplicate_content_to_site($post_id, $target_site_id) {
         }
     }
 
+    // Marcar la copia: la sincronización no le creará un synced_post a este sitio
+    update_post_meta($new_post_id, MMS_LOCAL_COPY_META, $post_id);
+
     restore_current_blog();
+
+    // Si el sitio ya tenía el synced_post de este original, sobra: ahora tiene el contenido real
+    mms_delete_synced_posts($target_site_id, mms_find_synced_posts_for_original($target_site_id, $post_id));
 
     return $new_post_id;
 }
