@@ -2,9 +2,10 @@
 /**
  * Compatibilidad con "Offload Media - Cloud Storage" en la red.
  *
- * Todos los sitios apuntan al mismo bucket con la misma estructura, así que al
- * duplicar un contenido la media no se copia: en el sitio destino se crea un
- * attachment que apunta al mismo objeto del bucket ("attachment compartido").
+ * Todos los sitios apuntan al mismo bucket con la misma estructura y no hay archivos
+ * locales, así que al duplicar un contenido la media nunca se copia: en el sitio destino
+ * se crea un attachment que apunta al mismo objeto del bucket ("attachment compartido").
+ * Desde la 1.3.0 tampoco hay copia física de respaldo si el objeto no está en el bucket.
  *
  * Además corrige dos problemas de Offload Media en multisite:
  *
@@ -57,13 +58,6 @@ function mms_offload_table_exists($blog_id = null) {
             && $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table)) === $table;
     }
     return $cache[$table];
-}
-
-/**
- * La tabla de Offload de la petición no es la del sitio actual (hay un switch_to_blog activo).
- */
-function mms_offload_context_mismatch() {
-    return mms_offload_available() && ACOOFM_ITEM_TABLE !== mms_offload_table();
 }
 
 /**
@@ -238,31 +232,3 @@ function mms_offload_protect_shared_object($post_id) {
     }
 }
 add_action('delete_attachment', 'mms_offload_protect_shared_object', 5);
-
-/* -------------------------------------------------------------------------
- * Copias físicas tras switch_to_blog()
- * ---------------------------------------------------------------------- */
-
-/**
- * Durante una copia física en otro sitio, Offload subiría el archivo y guardaría el item
- * en la tabla de la petición (la de otro sitio), pisando items ajenos. Mientras dura la
- * copia se desactiva la subida; el archivo queda local en el destino.
- */
-function mms_offload_disable_upload_filter($value) {
-    if (is_array($value) && isset($value['settings']) && is_array($value['settings'])) {
-        $value['settings']['copy_to_bucket'] = false;
-    }
-    return $value;
-}
-
-function mms_offload_suspend_upload() {
-    if (mms_offload_context_mismatch()) {
-        add_filter('option_acoofm_settings', 'mms_offload_disable_upload_filter', 999);
-        return true;
-    }
-    return false;
-}
-
-function mms_offload_resume_upload() {
-    remove_filter('option_acoofm_settings', 'mms_offload_disable_upload_filter', 999);
-}

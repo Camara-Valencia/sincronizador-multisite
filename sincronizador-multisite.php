@@ -201,7 +201,22 @@ function mms_show_original_post_type_info($post) {
     }
 }
 
+/**
+ * Attachment del sitio principal disponible en el sitio destino.
+ *
+ * Toda la media vive en el bucket con la misma ruta para todos los sitios: no se copia
+ * ningún archivo. En el destino se crea (o reutiliza) un attachment que apunta al mismo
+ * objeto del bucket; hace falta igualmente un ID local para que ACF, las funciones de
+ * imagen de WordPress y la reescritura de URLs de Offload funcionen en ese sitio.
+ *
+ * Si el original no está en el bucket (p. ej. su subida sigue en la cola de Offload)
+ * no se enlaza: se apunta en mms_media_failures() y se devuelve false.
+ *
+ * @return int|false
+ */
 function duplicate_attachment($attachment_id, $target_site_id = null) {
+    static $done = array();
+
     $attachment_id = (int) $attachment_id;
     if (!$attachment_id) {
         return false;
@@ -209,27 +224,27 @@ function duplicate_attachment($attachment_id, $target_site_id = null) {
 
     // Quien llama ya suele estar en el sitio destino
     $target_blog_id = $target_site_id ? (int) $target_site_id : get_current_blog_id();
-    $can_share = mms_offload_table_exists($target_blog_id);
 
-    switch_to_blog(get_main_site_id());
-    $attachment = get_post($attachment_id);
-    $shared = false;
-    $source = false;
-    if ($attachment && $attachment->post_type === 'attachment') {
-        // En el bucket común: se comparte el objeto, sin copiar el archivo.
-        // Si no está en el bucket (o el destino no tiene Offload): copia física.
-        $shared = $can_share ? mms_offload_get_share_data($attachment) : false;
-        if (!$shared) {
-            $source = mms_get_attachment_source($attachment_id);
-        }
+    // La misma imagen puede salir varias veces (destacada, ACF, contenido)
+    $key = $target_blog_id . ':' . $attachment_id;
+    if (array_key_exists($key, $done)) {
+        return $done[$key];
     }
-    // Volver siempre al blog de partida: antes el return sin restore y el
-    // switch_to_blog() anidado dejaban la pila de blogs desequilibrada y el resto
-    // de la petición seguía ejecutándose en el sitio equivocado.
-    restore_current_blog();
 
-    if (!$shared && !$source) {
-        return false;
+    $shared = false;
+    if (mms_offload_table_exists($target_blog_id)) {
+        switch_to_blog(get_main_site_id());
+        $attachment = get_post($attachment_id);
+        if ($attachment && $attachment->post_type === 'attachment') {
+            $shared = mms_offload_get_share_data($attachment);
+        }
+        restore_current_blog();
+    }
+
+    if (!$shared) {
+        error_log('[MMS] El adjunto ' . $attachment_id . ' del sitio principal no está en el bucket; no se enlaza en el sitio ' . $target_blog_id . '.');
+        mms_media_failures($attachment_id);
+        return $done[$key] = false;
     }
 
     $switched = $target_blog_id !== get_current_blog_id();
@@ -237,119 +252,94 @@ function duplicate_attachment($attachment_id, $target_site_id = null) {
         switch_to_blog($target_blog_id);
     }
 
-    $new_attachment_id = false;
-    if ($shared) {
-        $new_attachment_id = mms_offload_create_shared_attachment($shared);
-    }
-    if (!$new_attachment_id && $source) {
-        $new_attachment_id = mms_copy_attachment_file($source['path'], $source['name']);
-    }
+    $new_attachment_id = mms_offload_create_shared_attachment($shared);
 
     if ($switched) {
         restore_current_blog();
     }
 
-    if ($source && $source['temp']) {
-        @unlink($source['path']);
+    if (!$new_attachment_id) {
+        mms_media_failures($attachment_id);
     }
 
-    return $new_attachment_id;
+    return $done[$key] = $new_attachment_id ?: false;
 }
 
 /**
- * Archivo de origen de un attachment del sitio actual, listo para copiar.
+ * Adjuntos del principal que no se han podido enlazar en esta petición.
  *
- * Con Offload Media activo, get_attached_file() filtrado devuelve la URL del bucket
- * y file_exists() fallaba: la media se perdía sin avisar. Se usa la ruta local sin
- * filtrar y, si el archivo ya no está en disco (quitado del servidor tras subirlo),
- * se descarga a un temporal desde la URL del bucket.
- *
- * @return array|false array('path' => ruta local, 'name' => nombre de archivo, 'temp' => bool)
+ * @param int|null $attachment_id Si se indica, se añade a la lista.
+ * @return int[]
  */
-function mms_get_attachment_source($attachment_id) {
-    $local = get_attached_file($attachment_id, true);
-    if ($local && file_exists($local)) {
-        return array('path' => $local, 'name' => basename($local), 'temp' => false);
+function mms_media_failures($attachment_id = null) {
+    static $failures = array();
+    if ($attachment_id !== null) {
+        $failures[(int) $attachment_id] = (int) $attachment_id;
     }
-
-    // La URL del item se lee de la tabla del sitio actual: tras un switch_to_blog(),
-    // wp_get_attachment_url() de Offload puede resolver contra la tabla de otro sitio.
-    $row = mms_offload_get_row($attachment_id);
-    $url = $row ? $row['url'] : wp_get_attachment_url($attachment_id);
-    if (!$url) {
-        return false;
-    }
-
-    if (!function_exists('download_url')) {
-        require_once ABSPATH . 'wp-admin/includes/file.php';
-    }
-    $tmp = download_url($url, 60);
-    if (is_wp_error($tmp)) {
-        error_log('[MMS] No se pudo descargar el adjunto ' . $attachment_id . ': ' . $tmp->get_error_message());
-        return false;
-    }
-
-    $name = $local ? basename($local) : basename(wp_parse_url($url, PHP_URL_PATH));
-    return array('path' => $tmp, 'name' => $name, 'temp' => true);
+    return array_values($failures);
 }
 
 /**
- * Copia el archivo al uploads del sitio actual y crea su attachment.
- *
- * @param string $file_path Ruta local del archivo de origen.
- * @param string $name      Nombre de archivo de destino (por defecto, el del origen).
+ * Texto de aviso para los adjuntos que no se han podido enlazar ('' si no hay).
  */
-function mms_copy_attachment_file($file_path, $name = '') {
-
-    if (!$file_path || !file_exists($file_path)) {
-        return false;
+function mms_media_failures_message() {
+    $failures = mms_media_failures();
+    if (!$failures) {
+        return '';
     }
-    // Copiar el archivo a la carpeta de uploads del sitio actual
-    $upload_dir = wp_upload_dir();
-    if (!empty($upload_dir['error'])) {
-        return false;
-    }
-    $filename = wp_unique_filename($upload_dir['path'], sanitize_file_name($name ?: basename($file_path)));
-    $new_file = $upload_dir['path'] . '/' . $filename;
-
-    if (!@copy($file_path, $new_file)) {
-        return false;
-    }
-
-    // Tras un switch_to_blog(), Offload guardaría el item en la tabla de otro sitio
-    $suspended = mms_offload_suspend_upload();
-    $new_attachment_id = mms_create_attachment_from_file($new_file, $filename);
-    if ($suspended) {
-        mms_offload_resume_upload();
-    }
-
-    return $new_attachment_id;
-}
-
-/**
- * Crea el attachment del archivo ya copiado en el uploads del sitio actual.
- */
-function mms_create_attachment_from_file($new_file, $filename) {
-    $filetype = wp_check_filetype($filename, null);
-    $attachment_data = array(
-        'post_mime_type' => $filetype['type'],
-        'post_title'     => sanitize_file_name($filename),
-        'post_content'   => '',
-        'post_status'    => 'inherit'
+    return sprintf(
+        '%d imagen(es)/archivo(s) no estaban en el bucket y no se han enlazado (IDs en el sitio principal: %s). Espera a que Offload termine de subirlos y vuelve a duplicar, o asígnalos a mano.',
+        count($failures),
+        implode(', ', $failures)
     );
-    $new_attachment_id = wp_insert_attachment($attachment_data, $new_file);
-    if (!$new_attachment_id || is_wp_error($new_attachment_id)) {
-        @unlink($new_file);
-        return false;
+}
+
+/**
+ * Cambia en el contenido los IDs de media del sitio principal por los de los attachments
+ * compartidos en el sitio actual (el destino).
+ *
+ * Offload reescribe cada <img> al bucket a partir del ID de su clase wp-image-{ID}: con
+ * el ID del principal, en el subsitio no se reescribía y la imagen apuntaba al uploads
+ * local del dominio principal, que no tiene archivos. Se tocan:
+ *   - class="wp-image-{ID}" y data-id="{ID}" (galerías)
+ *   - "id", "mediaId" e "ids" en los comentarios de los bloques de media
+ * Si un adjunto no se puede enlazar, su ID se deja como está.
+ */
+function mms_duplicate_content_media($content) {
+    if (!is_string($content) || $content === '') {
+        return $content;
     }
 
-    require_once( ABSPATH . 'wp-admin/includes/image.php' );
-    require_once( ABSPATH . 'wp-admin/includes/media.php' );
-    require_once( ABSPATH . 'wp-admin/includes/file.php' );
-    $attach_data = wp_generate_attachment_metadata($new_attachment_id, $new_file);
-    wp_update_attachment_metadata($new_attachment_id, $attach_data);
+    $map = function ($old_id) {
+        $new_id = duplicate_attachment((int) $old_id);
+        return $new_id ? (int) $new_id : (int) $old_id;
+    };
 
-    return $new_attachment_id;
+    // Comentarios de bloques de media
+    $content = preg_replace_callback(
+        '/<!--\s+wp:(image|cover|file|video|audio|media-text|gallery)\s+(\{.*?\})\s+(\/?)-->/s',
+        function ($m) use ($map) {
+            $json = preg_replace_callback('/"(id|mediaId)":(\d+)/', function ($a) use ($map) {
+                return '"' . $a[1] . '":' . $map($a[2]);
+            }, $m[2]);
+            $json = preg_replace_callback('/"ids":\[([\d,\s]*)\]/', function ($a) use ($map) {
+                $ids = array_filter(array_map('trim', explode(',', $a[1])), 'strlen');
+                return '"ids":[' . implode(',', array_map($map, $ids)) . ']';
+            }, $json);
+            return '<!-- wp:' . $m[1] . ' ' . $json . ' ' . ($m[3] ? '/' : '') . '-->';
+        },
+        $content
+    );
+
+    // HTML
+    $content = preg_replace_callback('/\bwp-image-(\d+)\b/', function ($m) use ($map) {
+        return 'wp-image-' . $map($m[1]);
+    }, $content);
+    $content = preg_replace_callback('/\bdata-id="(\d+)"/', function ($m) use ($map) {
+        return 'data-id="' . $map($m[1]) . '"';
+    }, $content);
+
+    return $content;
 }
 
 function mms_duplicate_acf_media_recursive($field_value, $field_object) {
@@ -363,9 +353,8 @@ function mms_duplicate_acf_media_recursive($field_value, $field_object) {
         if (!empty($field_value)) {
             $media_id = is_array($field_value) && isset($field_value['ID']) ? $field_value['ID'] : $field_value;
             $new_media_id = duplicate_attachment($media_id);
-            if ($new_media_id) {
-                return $new_media_id;
-            }
+            // Sin enlazar se deja vacío: el ID del principal en el subsitio es otro adjunto (o ninguno)
+            return $new_media_id ? $new_media_id : '';
         }
         return $field_value;
     }
@@ -493,13 +482,15 @@ function mms_handle_duplicate_action() {
 
     restore_current_blog(); // Volver al subsitio
 
-    // Duplicar imagen destacada (duplicate_attachment soporta archivos en Offload Media)
+    // Imagen destacada: attachment compartido del bucket, sin copiar archivos
     $new_thumbnail_id = $thumbnail_id ? duplicate_attachment($thumbnail_id) : false;
 
-    // Crear la nueva entrada en el subsitio actual, duplicando también la fecha de creación y publicando
+    // Crear la nueva entrada en el subsitio actual, duplicando también la fecha de creación y publicando.
+    // wp_slash(): wp_insert_post() quita barras y rompía los \u00xx del JSON de los bloques.
     $new_post_args = array(
-        'post_title'   => $original_post->post_title,
-        'post_content' => $original_post->post_content,
+        'post_title'   => wp_slash($original_post->post_title),
+        'post_content' => wp_slash(mms_duplicate_content_media($original_post->post_content)),
+        'post_excerpt' => wp_slash($original_post->post_excerpt),
         'post_status'  => 'publish',
         'post_type'    => $original_post->post_type,
         'post_date'    => $original_post->post_date,
@@ -545,10 +536,30 @@ function mms_handle_duplicate_action() {
     // Eliminar el post sincronizado (definitivamente: en la papelera no aporta nada)
     wp_delete_post($synced_post_id, true);
     
-    // Redirigir al usuario
-    wp_redirect(admin_url('edit.php?post_type=' . $original_post->post_type));
+    // Redirigir al usuario (con aviso si alguna media no estaba en el bucket)
+    $redirect = admin_url('edit.php?post_type=' . $original_post->post_type);
+    if (mms_media_failures()) {
+        $redirect = add_query_arg('mms_media_fallos', implode(',', mms_media_failures()), $redirect);
+    }
+    wp_safe_redirect($redirect);
     exit;
 }
+
+// Aviso tras "Duplicar" si alguna media no se pudo enlazar
+add_action('admin_notices', function () {
+    if (empty($_GET['mms_media_fallos'])) {
+        return;
+    }
+    $ids = array_filter(array_map('intval', explode(',', wp_unslash($_GET['mms_media_fallos']))));
+    if (!$ids) {
+        return;
+    }
+    printf(
+        '<div class="notice notice-warning is-dismissible"><p>Contenido duplicado, pero %d imagen(es)/archivo(s) no estaban en el bucket y no se han enlazado (IDs en el sitio principal: %s). Asígnalos a mano o vuelve a duplicar cuando Offload termine de subirlos.</p></div>',
+        count($ids),
+        esc_html(implode(', ', $ids))
+    );
+});
 
 function get_post_type_title_by_id($post_id) {
     $post_type_slug = get_post_type($post_id);
@@ -749,7 +760,7 @@ function mms_handle_duplicate_content_ajax() {
         wp_send_json_error($result->get_error_message());
     } else {
         wp_send_json_success(array(
-            'message' => 'Contenido duplicado exitosamente',
+            'message' => trim('Contenido duplicado exitosamente. ' . esc_html(mms_media_failures_message())),
             'new_post_id' => $result,
             'target_site_url' => get_admin_url($target_site_id, 'post.php?post=' . $result . '&action=edit')
         ));
@@ -850,9 +861,11 @@ function mms_duplicate_content_to_site($post_id, $target_site_id) {
 
     // Crear nuevo post
     $new_post_data = array(
-        'post_title' => $post->post_title,
-        'post_content' => $post->post_content,
-        'post_excerpt' => $post->post_excerpt,
+        // wp_slash(): wp_insert_post() quita barras y rompía los \u00xx del JSON de los bloques.
+        // Los IDs de media del contenido pasan a los attachments compartidos de este sitio.
+        'post_title' => wp_slash($post->post_title),
+        'post_content' => wp_slash(mms_duplicate_content_media($post->post_content)),
+        'post_excerpt' => wp_slash($post->post_excerpt),
         'post_status' => $post->post_status,
         'post_type' => $post->post_type,
         'post_author' => get_current_user_id(),
@@ -880,7 +893,8 @@ function mms_duplicate_content_to_site($post_id, $target_site_id) {
             continue;
         }
         foreach ($meta_values as $meta_value) {
-            add_post_meta($new_post_id, $meta_key, maybe_unserialize($meta_value));
+            // wp_slash(): add_post_meta() quita barras (rompía JSON y rutas guardadas en meta)
+            add_post_meta($new_post_id, $meta_key, wp_slash(maybe_unserialize($meta_value)));
         }
     }
 
