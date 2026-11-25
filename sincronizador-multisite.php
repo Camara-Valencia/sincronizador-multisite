@@ -224,49 +224,124 @@ function mms_media_failures_message() {
 }
 
 /**
+ * URL directa del bucket de un archivo de un adjunto del sitio principal.
+ *
+ * Todos los tamaños de una imagen están en la misma carpeta del bucket, así que se toma
+ * la carpeta del item de Offload del original y el nombre de archivo de $src (que indica
+ * el tamaño). Requiere bucket público y URLs que no caducan.
+ *
+ * @return string '' si el adjunto no está en el bucket
+ */
+function mms_bucket_url_for($attachment_id, $src) {
+    $file = wp_basename((string) wp_parse_url($src, PHP_URL_PATH));
+    if ($file === '') {
+        return '';
+    }
+
+    switch_to_blog(get_main_site_id());
+    $row = mms_offload_get_row((int) $attachment_id);
+    restore_current_blog();
+
+    if (!$row || empty($row['url'])) {
+        return '';
+    }
+
+    return trailingslashit(dirname($row['url'])) . rawurlencode(rawurldecode($file));
+}
+
+/**
  * Cambia en el contenido los IDs de media del sitio principal por los de los attachments
  * compartidos en el sitio actual (el destino).
  *
- * Offload reescribe cada <img> al bucket a partir del ID de su clase wp-image-{ID}: con
- * el ID del principal, en el subsitio no se reescribía y la imagen apuntaba al uploads
- * local del dominio principal, que no tiene archivos. Se tocan:
+ * Offload elige la imagen SOLO por el ID (wp-image-{ID} de la clase), sin mirar la URL:
+ * un ID del principal sin cambiar mostraba en cada subsitio el adjunto que tuviera ese
+ * número allí, es decir, una imagen distinta en cada sitio. Se tocan:
  *   - class="wp-image-{ID}" y data-id="{ID}" (galerías)
  *   - "id", "mediaId" e "ids" en los comentarios de los bloques de media
- * Si un adjunto no se puede enlazar, su ID se deja como está.
+ *
+ * Si un adjunto no se puede enlazar, se le QUITA el ID (Offload ya no lo toca) y su
+ * <img> pasa a apuntar directamente a la URL del bucket del original. Nunca queda un ID
+ * del principal en el contenido del subsitio.
  */
 function mms_duplicate_content_media($content) {
     if (!is_string($content) || $content === '') {
         return $content;
     }
 
-    $map = function ($old_id) {
-        $new_id = duplicate_attachment((int) $old_id);
-        return $new_id ? (int) $new_id : (int) $old_id;
+    // ID del principal => ID en el destino (0 = no se ha podido enlazar)
+    $resolved = array();
+    $map = function ($old_id) use (&$resolved) {
+        $old_id = (int) $old_id;
+        if (!isset($resolved[$old_id])) {
+            $resolved[$old_id] = (int) duplicate_attachment($old_id);
+        }
+        return $resolved[$old_id];
     };
 
-    // Comentarios de bloques de media
+    // 1. <img>: wp-image-{ID} y data-id="{ID}" (galerías antiguas)
+    $content = preg_replace_callback('/<img\b[^>]*>/i', function ($m) use ($map) {
+        $tag    = $m[0];
+        $failed = 0;
+
+        $tag = preg_replace_callback('/(\s*)\bwp-image-(\d+)\b/', function ($c) use ($map, &$failed) {
+            $new_id = $map($c[2]);
+            if ($new_id) {
+                return $c[1] . 'wp-image-' . $new_id;
+            }
+            $failed = (int) $c[2];
+            return '';
+        }, $tag);
+
+        $tag = preg_replace_callback('/\s+data-id="(\d+)"/', function ($c) use ($map, &$failed) {
+            $new_id = $map($c[1]);
+            if ($new_id) {
+                return ' data-id="' . $new_id . '"';
+            }
+            $failed = $failed ?: (int) $c[1];
+            return '';
+        }, $tag);
+
+        // Sin enlazar: ya sin ID, src directo al bucket del original
+        if ($failed) {
+            $tag = preg_replace('/\s+(srcset|sizes)="[^"]*"/i', '', $tag);
+            if (preg_match('/\bsrc="([^"]*)"/i', $tag, $src_match)) {
+                $bucket = mms_bucket_url_for($failed, html_entity_decode($src_match[1]));
+                if ($bucket) {
+                    $tag = str_replace($src_match[0], 'src="' . esc_url($bucket) . '"', $tag);
+                }
+            }
+        }
+
+        return $tag;
+    }, $content);
+
+    // 2. Comentarios de bloques de media
     $content = preg_replace_callback(
         '/<!--\s+wp:(image|cover|file|video|audio|media-text|gallery)\s+(\{.*?\})\s+(\/?)-->/s',
         function ($m) use ($map) {
-            $json = preg_replace_callback('/"(id|mediaId)":(\d+)/', function ($a) use ($map) {
-                return '"' . $a[1] . '":' . $map($a[2]);
-            }, $m[2]);
-            $json = preg_replace_callback('/"ids":\[([\d,\s]*)\]/', function ($a) use ($map) {
-                $ids = array_filter(array_map('trim', explode(',', $a[1])), 'strlen');
-                return '"ids":[' . implode(',', array_map($map, $ids)) . ']';
-            }, $json);
-            return '<!-- wp:' . $m[1] . ' ' . $json . ' ' . ($m[3] ? '/' : '') . '-->';
+            $attrs = json_decode($m[2], true);
+            if (!is_array($attrs)) {
+                return $m[0];
+            }
+            foreach (array('id', 'mediaId') as $key) {
+                if (isset($attrs[$key]) && is_numeric($attrs[$key])) {
+                    $new_id = $map($attrs[$key]);
+                    if ($new_id) {
+                        $attrs[$key] = $new_id;
+                    } else {
+                        unset($attrs[$key]);
+                    }
+                }
+            }
+            if (isset($attrs['ids']) && is_array($attrs['ids'])) {
+                $attrs['ids'] = array_values(array_filter(array_map($map, $attrs['ids'])));
+            }
+            // Mismo formato que serialize_block_attributes() de WordPress
+            $json = $attrs ? serialize_block_attributes($attrs) : '';
+            return '<!-- wp:' . $m[1] . ($json !== '' && $json !== '[]' ? ' ' . $json : '') . ' ' . ($m[3] ? '/' : '') . '-->';
         },
         $content
     );
-
-    // HTML
-    $content = preg_replace_callback('/\bwp-image-(\d+)\b/', function ($m) use ($map) {
-        return 'wp-image-' . $map($m[1]);
-    }, $content);
-    $content = preg_replace_callback('/\bdata-id="(\d+)"/', function ($m) use ($map) {
-        return 'data-id="' . $map($m[1]) . '"';
-    }, $content);
 
     return $content;
 }
