@@ -148,6 +148,17 @@ function mms_find_local_copies_bulk($blog_id, array $originals) {
  * @return array<int, string> ID del synced_post => motivo
  */
 function mms_find_orphan_synced_posts($blog_id) {
+    $analysis = mms_analyze_synced_posts($blog_id);
+    return $analysis['orphans'];
+}
+
+/**
+ * Clasifica los synced_post de un subsitio.
+ *
+ * @return array( 'orphans' => array( synced_id => motivo ), 'kept' => array( original_id => synced_id ) )
+ *         'kept' son los válidos: original publicado, sin copia propia, uno por original.
+ */
+function mms_analyze_synced_posts($blog_id) {
     global $wpdb;
 
     $prefix      = $wpdb->get_blog_prefix($blog_id);
@@ -199,7 +210,7 @@ function mms_find_orphan_synced_posts($blog_id) {
         }
     }
 
-    return $orphans;
+    return array('orphans' => $orphans, 'kept' => $kept);
 }
 
 /**

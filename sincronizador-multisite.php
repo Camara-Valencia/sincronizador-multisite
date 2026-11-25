@@ -2,7 +2,7 @@
 /*
 Plugin Name: Sincronizador Multisite
 Description: Sincroniza entradas entre el sitio principal y los subsitios.
-Version: 1.3.0
+Version: 1.4.0
 Author: Tu Nombre
 Network: true
 */
@@ -10,7 +10,7 @@ Network: true
 // Evita el acceso directo
 defined( 'ABSPATH' ) || exit;
 
-define('MMS_VERSION', '1.3.0');
+define('MMS_VERSION', '1.4.0');
 
 // Meta que marca, en un subsitio, el contenido local que viene de un original del
 // principal ("Duplicar" o "Duplicar en"). Valor: ID del original.
@@ -40,6 +40,9 @@ require_once plugin_dir_path(__FILE__) . 'includes/offload-compat.php';
 // Borrado de synced_post al despublicar el original y limpieza de huérfanos
 require_once plugin_dir_path(__FILE__) . 'includes/cleanup.php';
 
+// Clonado de los contenidos en los subsitios (en segundo plano) y conversión de synced_post
+require_once plugin_dir_path(__FILE__) . 'includes/clone.php';
+
 // Hook para crear el post type personalizado
 add_action('init', 'mms_register_synced_post_type');
 
@@ -59,83 +62,9 @@ function mms_register_synced_post_type() {
     register_post_type('synced_post', $args);
 }
 
-// Hook para sincronizar el post cuando se guarda en el sitio principal
-add_action('save_post', 'mms_sync_post_to_sites', 10, 2);
-
-function mms_sync_post_to_sites($post_id, $post) {
-    // Interruptor de emergencia: define( 'MMS_DISABLE_SYNC', true ); en wp-config.php
-    // para la sincronización automática sin desactivar el plugin (los synced_post
-    // existentes siguen registrados y visibles en los subsitios).
-    if (defined('MMS_DISABLE_SYNC') && MMS_DISABLE_SYNC) {
-        return;
-    }
-
-    // Solo desde el sitio principal; evitar revisiones, autosaves y auto-drafts
-    if (!is_main_site() || wp_is_post_revision($post_id) || $post->post_status === 'auto-draft' || (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE)) {
-        return;
-    }
-
-    // Solo contenidos publicados: el synced_post se crea siempre como 'publish', así que
-    // sincronizar borradores/pendientes/privados (p. ej. los que genera la IA) los hacía
-    // públicos en los subsitios y disparaba en cada subsitio el vaciado de cachés.
-    if ($post->post_status !== 'publish') {
-        return;
-    }
-
-    // Subsitios configurados para este tipo de contenido en
-    // Administración de la red → Ajustes → Sincronización.
-    $target_sites = mms_get_sync_target_sites($post->post_type);
-    if (empty($target_sites)) {
-        return;
-    }
-
-    // Solo subsitios activos (la matriz puede conservar sitios archivados o borrados después)
-    $valid_sites = array_map('intval', wp_list_pluck(mms_get_sync_subsites(), 'blog_id'));
-
-    $type_info = null;
-
-    foreach ($target_sites as $site_id) {
-        if (!in_array($site_id, $valid_sites, true)) {
-            continue;
-        }
-
-        // Las comprobaciones son consultas directas: solo se cambia de blog si hay que crear algo.
-        // Antes se hacía switch_to_blog() + meta_query en cada subsitio en cada guardado.
-
-        // Ya tiene synced_post en cualquier estado. Incluye la papelera: si un subsitio lo
-        // ocultó a propósito no se vuelve a crear (antes 'any' excluía la papelera).
-        if (mms_find_synced_posts_for_original($site_id, $post_id)) {
-            continue;
-        }
-
-        // Ya tiene el contenido como propio: convertido con "Duplicar", copiado con
-        // "Duplicar en" o creado a mano con el mismo tipo y slug. Antes se le volvía a
-        // crear un synced_post y el contenido salía dos veces en el subsitio.
-        if (mms_find_local_copy($site_id, $post_id, $post->post_type, $post->post_name)) {
-            continue;
-        }
-
-        if ($type_info === null) {
-            $type_info = get_post_type_title_by_id($post_id);
-        }
-
-        switch_to_blog($site_id);
-
-        $new_post_id = wp_insert_post(array(
-            'post_title'  => $post->post_title,
-            'post_type'   => 'synced_post',
-            'post_status' => 'publish',
-        ));
-
-        if ($new_post_id && !is_wp_error($new_post_id)) {
-            mms_update_field('original_post_id', $post_id, $new_post_id);
-            mms_update_field('original_post_type_slug', $type_info->slug, $new_post_id);
-            mms_update_field('original_post_type_title', $type_info->title, $new_post_id);
-        }
-
-        restore_current_blog();
-    }
-}
+// Al publicar en el principal ya no se crean synced_post: se clona el contenido en los
+// subsitios de la matriz, en segundo plano (includes/clone.php). El tipo synced_post se
+// mantiene para los que ya existen hasta convertirlos o limpiarlos.
 
 // Hook para añadir el botón de duplicar
 add_filter('post_row_actions', 'mms_add_duplicate_button', 10, 2);
@@ -445,97 +374,24 @@ function mms_handle_duplicate_action() {
         wp_die('La entrada sincronizada no tiene contenido original asociado.');
     }
 
-    // Obtener el contenido del post original del sitio principal
-    switch_to_blog(get_main_site_id());
-    $original_post = get_post($original_post_id);
+    $original_post = get_blog_post(get_main_site_id(), $original_post_id);
     if (!$original_post) {
-        restore_current_blog();
         wp_die('El post original no fue encontrado.');
     }
 
-    // Obtener taxonomías y términos asociados
-    $taxonomies = get_object_taxonomies($original_post->post_type);
-    $terms_by_tax = array();
-    foreach ($taxonomies as $taxonomy) {
-        $terms = wp_get_object_terms($original_post_id, $taxonomy, array('fields' => 'slugs'));
-        if (!empty($terms) && !is_wp_error($terms)) {
-            $terms_by_tax[$taxonomy] = $terms;
-        }
+    // Clon vinculado (se actualizará con los cambios del principal mientras no se edite aquí).
+    // Si ya hay un clon, se actualiza en lugar de crear otro. Borra el synced_post.
+    $clone = mms_find_clone(get_current_blog_id(), $original_post_id);
+    $new_post_id = mms_clone_post_to_site($original_post_id, get_current_blog_id(), $clone && $clone['post_status'] !== 'trash' ? (int) $clone['ID'] : 0);
+    if (is_wp_error($new_post_id)) {
+        wp_die('No se pudo crear el contenido: ' . esc_html($new_post_id->get_error_message()));
     }
 
-    // Obtener campos ACF
-    if (function_exists('get_fields')) {
-        $acf_fields = get_fields($original_post_id);
-    } else {
-        $acf_fields = array();
+    // Por si el synced_post no apuntaba al original por la meta (se borra igualmente)
+    if (get_post($synced_post_id)) {
+        wp_delete_post($synced_post_id, true);
     }
 
-    // Precalcular los objetos de campo ACF en el principal (evita un switch por campo)
-    $acf_field_objects = array();
-    if (!empty($acf_fields) && function_exists('get_field_object')) {
-        foreach ($acf_fields as $field_key => $field_value) {
-            $acf_field_objects[$field_key] = get_field_object($field_key, $original_post_id);
-        }
-    }
-
-    $thumbnail_id = get_post_thumbnail_id($original_post_id);
-
-    restore_current_blog(); // Volver al subsitio
-
-    // Imagen destacada: attachment compartido del bucket, sin copiar archivos
-    $new_thumbnail_id = $thumbnail_id ? duplicate_attachment($thumbnail_id) : false;
-
-    // Crear la nueva entrada en el subsitio actual, duplicando también la fecha de creación y publicando.
-    // wp_slash(): wp_insert_post() quita barras y rompía los \u00xx del JSON de los bloques.
-    $new_post_args = array(
-        'post_title'   => wp_slash($original_post->post_title),
-        'post_content' => wp_slash(mms_duplicate_content_media($original_post->post_content)),
-        'post_excerpt' => wp_slash($original_post->post_excerpt),
-        'post_status'  => 'publish',
-        'post_type'    => $original_post->post_type,
-        'post_date'    => $original_post->post_date,
-        'post_date_gmt'=> $original_post->post_date_gmt,
-    );
-    $new_post_id = wp_insert_post($new_post_args, true);
-    if (is_wp_error($new_post_id) || !$new_post_id) {
-        wp_die('No se pudo crear el contenido: ' . (is_wp_error($new_post_id) ? esc_html($new_post_id->get_error_message()) : 'error desconocido'));
-    }
-
-    // Asignar imagen destacada duplicada si existe
-    if ($new_thumbnail_id) {
-        set_post_thumbnail($new_post_id, $new_thumbnail_id);
-    }
-    
-    // Asignar taxonomías y términos
-    if (!empty($terms_by_tax)) {
-        foreach ($terms_by_tax as $taxonomy => $terms) {
-            // Asignar términos por slug (no por ID)
-            wp_set_object_terms($new_post_id, $terms, $taxonomy, false);
-        }
-    }
-
-    // Duplicar y asignar archivos/media de campos ACF tipo file, image, gallery
-    if (!empty($acf_fields) && function_exists('update_field')) {
-        foreach ($acf_fields as $field_key => $field_value) {
-            $field_object = isset($acf_field_objects[$field_key]) ? $acf_field_objects[$field_key] : false;
-
-            if (!$field_object) {
-                update_field($field_key, $field_value, $new_post_id);
-                continue;
-            }
-
-            $new_value = mms_duplicate_acf_media_recursive($field_value, $field_object);
-
-            update_field($field_key, $new_value, $new_post_id);
-        }
-    }
-
-    // Marcar la copia local: la sincronización ya no volverá a crear un synced_post aquí
-    update_post_meta($new_post_id, MMS_LOCAL_COPY_META, $original_post_id);
-
-    // Eliminar el post sincronizado (definitivamente: en la papelera no aporta nada)
-    wp_delete_post($synced_post_id, true);
-    
     // Redirigir al usuario (con aviso si alguna media no estaba en el bucket)
     $redirect = admin_url('edit.php?post_type=' . $original_post->post_type);
     if (mms_media_failures()) {
@@ -754,7 +610,8 @@ function mms_handle_duplicate_content_ajax() {
     }
     
     // Perform content duplication
-    $result = mms_duplicate_content_to_site($post_id, $target_site_id);
+    $clone  = mms_find_clone($target_site_id, $post_id);
+    $result = mms_clone_post_to_site($post_id, $target_site_id, $clone && $clone['post_status'] !== 'trash' ? (int) $clone['ID'] : 0);
     
     if (is_wp_error($result)) {
         wp_send_json_error($result->get_error_message());
@@ -816,131 +673,4 @@ function mms_get_available_sites_ajax() {
     }
 
     wp_send_json_success(array('sites' => $available_sites));
-}
-
-/**
- * Duplicate content to another site using existing attachment handling
- */
-function mms_duplicate_content_to_site($post_id, $target_site_id) {
-    // Obtener todos los datos necesarios ANTES de cambiar de blog
-    $post = get_post($post_id);
-    if (!$post) {
-        return new WP_Error('post_not_found', 'Post no encontrado.');
-    }
-
-    // Obtener meta del post
-    $post_meta = get_post_meta($post_id);
-
-    // Obtener imagen destacada
-    $thumbnail_id = get_post_thumbnail_id($post_id);
-
-    // Obtener taxonomías y términos
-    $taxonomies = get_object_taxonomies($post->post_type);
-    $terms_by_tax = array();
-    foreach ($taxonomies as $taxonomy) {
-        $terms = wp_get_post_terms($post_id, $taxonomy, array('fields' => 'names'));
-        if (!is_wp_error($terms) && !empty($terms)) {
-            $terms_by_tax[$taxonomy] = $terms;
-        }
-    }
-
-    // Obtener campos ACF
-    $acf_fields = array();
-    $acf_field_objects = array();
-    if (function_exists('get_fields')) {
-        $acf_fields = get_fields($post_id);
-        if (!empty($acf_fields) && function_exists('get_field_object')) {
-            foreach ($acf_fields as $field_key => $field_value) {
-                $acf_field_objects[$field_key] = get_field_object($field_key, $post_id);
-            }
-        }
-    }
-
-    // Cambiar al sitio destino
-    switch_to_blog($target_site_id);
-
-    // Crear nuevo post
-    $new_post_data = array(
-        // wp_slash(): wp_insert_post() quita barras y rompía los \u00xx del JSON de los bloques.
-        // Los IDs de media del contenido pasan a los attachments compartidos de este sitio.
-        'post_title' => wp_slash($post->post_title),
-        'post_content' => wp_slash(mms_duplicate_content_media($post->post_content)),
-        'post_excerpt' => wp_slash($post->post_excerpt),
-        'post_status' => $post->post_status,
-        'post_type' => $post->post_type,
-        'post_author' => get_current_user_id(),
-        'post_date' => $post->post_date,
-        'post_date_gmt' => $post->post_date_gmt,
-        'comment_status' => $post->comment_status,
-        'ping_status' => $post->ping_status,
-        'post_parent' => $post->post_parent,
-        'menu_order' => $post->menu_order,
-        'post_mime_type' => $post->post_mime_type,
-    );
-
-    $new_post_id = wp_insert_post($new_post_data);
-
-    if (is_wp_error($new_post_id)) {
-        restore_current_blog();
-        return $new_post_id;
-    }
-
-    // Copiar meta del post, salvo la que solo tiene sentido en el sitio de origen
-    // (IDs de otro sitio, bloqueos de edición, estado de tic-sync)
-    $skip_meta = array('_thumbnail_id', '_edit_lock', '_edit_last', '_wp_old_slug', '_tic_remote_id', '_tic_sync_pending', MMS_LOCAL_COPY_META);
-    foreach ($post_meta as $meta_key => $meta_values) {
-        if (in_array($meta_key, $skip_meta, true)) {
-            continue;
-        }
-        foreach ($meta_values as $meta_value) {
-            // wp_slash(): add_post_meta() quita barras (rompía JSON y rutas guardadas en meta)
-            add_post_meta($new_post_id, $meta_key, wp_slash(maybe_unserialize($meta_value)));
-        }
-    }
-
-    // Copiar imagen destacada usando la función de duplicación de attachments
-    if ($thumbnail_id) {
-        $new_thumbnail_id = duplicate_attachment($thumbnail_id, $target_site_id);
-
-        if ($new_thumbnail_id) {
-            set_post_thumbnail($new_post_id, $new_thumbnail_id);
-        }
-    }
-
-     // Asignar taxonomías y términos
-     if (!empty($terms_by_tax)) {
-        foreach ($terms_by_tax as $taxonomy => $terms) {
-            // Asignar términos por slug (no por ID)
-            wp_set_object_terms($new_post_id, $terms, $taxonomy, false);
-        }
-    }
-
-    // Duplicar y asignar archivos/media de campos ACF tipo file, image, gallery
-    if (!empty($acf_fields) && function_exists('update_field')) {
-        foreach ($acf_fields as $field_key => $field_value) {
-            // Calculados antes de cambiar de blog. Antes se hacía switch_to_blog(main) +
-            // switch_to_blog(target) por campo, sin restore: la pila de blogs crecía y
-            // ms_is_switched() seguía a true el resto de la petición.
-            $field_object = isset($acf_field_objects[$field_key]) ? $acf_field_objects[$field_key] : false;
-
-            if (!$field_object) {
-                update_field($field_key, $field_value, $new_post_id);
-                continue;
-            }
-
-            $new_value = mms_duplicate_acf_media_recursive($field_value, $field_object);
-
-            update_field($field_key, $new_value, $new_post_id);
-        }
-    }
-
-    // Marcar la copia: la sincronización no le creará un synced_post a este sitio
-    update_post_meta($new_post_id, MMS_LOCAL_COPY_META, $post_id);
-
-    restore_current_blog();
-
-    // Si el sitio ya tenía el synced_post de este original, sobra: ahora tiene el contenido real
-    mms_delete_synced_posts($target_site_id, mms_find_synced_posts_for_original($target_site_id, $post_id));
-
-    return $new_post_id;
 }

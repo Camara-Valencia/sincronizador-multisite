@@ -223,11 +223,15 @@ function mms_render_network_settings_page() {
         <p>
             Marca qué tipos de contenido del sitio principal
             (<strong><?php echo esc_html(get_blog_option(get_main_site_id(), 'blogname')); ?></strong>)
-            se sincronizan con cada subsitio. <strong>Sólo lo que esté marcado se sincroniza.</strong>
+            se clonan en cada subsitio. <strong>Sólo lo que esté marcado se clona.</strong>
         </p>
         <p class="description">
-            El cambio se aplica a los contenidos que se guarden a partir de ahora. Los posts sincronizados
-            que ya existen en los subsitios no se crean ni se borran al cambiar esta tabla.
+            Al publicar o actualizar un contenido en el principal se clona (o se actualiza su clon) en
+            segundo plano, un subsitio cada <?php echo (int) MMS_CLONE_STAGGER; ?> segundos. Un clon editado
+            en su subsitio queda desvinculado y ya no se toca. Al despublicar o borrar el original, sus
+            clones vinculados pasan a borrador.<br>
+            El cambio de esta tabla se aplica a los contenidos que se guarden a partir de ahora: no crea
+            ni borra clones existentes.
         </p>
 
         <?php if (empty($sites)) : ?>
@@ -286,6 +290,8 @@ function mms_render_network_settings_page() {
                 <?php submit_button('Guardar cambios'); ?>
             </form>
         <?php endif; ?>
+
+        <?php if (function_exists('mms_render_convert_section')) { mms_render_convert_section(); } ?>
 
         <?php if (function_exists('mms_render_cleanup_section')) { mms_render_cleanup_section(); } ?>
     </div>
